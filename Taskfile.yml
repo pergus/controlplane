@@ -1,0 +1,89 @@
+version: '3'
+
+vars:
+  BIN_DIR: bin
+
+tasks:
+  default:
+    desc: List available tasks
+    cmds:
+      - task --list
+
+  build:
+    desc: Build all components
+    cmds:
+      - task: build-api-server
+      - task: build-dns-controller
+      - task: build-certificate-controller
+
+  build-api-server:
+    desc: Build the API server
+    cmds:
+      - go build -o {{.BIN_DIR}}/api-server ./api-server
+
+  build-dns-controller:
+    desc: Build the DNS controller
+    cmds:
+      - go build -o {{.BIN_DIR}}/dns-controller ./dns-controller
+
+  build-certificate-controller:
+    desc: Build the certificate controller
+    cmds:
+      - go build -o {{.BIN_DIR}}/certificate-controller ./certificate-controller
+
+  run:
+    desc: Run the API server
+    cmds:
+      - go run ./api-server
+
+  run-dns:
+    desc: Run the DNS controller
+    cmds:
+      - go run ./dns-controller
+
+  run-certificate:
+    desc: Run the certificate controller
+    cmds:
+      - go run ./certificate-controller
+
+  test:
+    desc: Run all tests
+    cmds:
+      - go test ./...
+
+  test-dns:
+    desc: Test DNS controller with 20 resources
+    cmds:
+      - ./scripts/test-dns-controller.sh
+
+  test-certificates:
+    desc: Test certificate controller with 20 resources
+    cmds:
+      - ./scripts/test-certificate-controller.sh
+
+  test-controllers:
+    desc: Run controller integration tests
+    cmds:
+      - ./scripts/test-controllers.sh
+
+  fmt:
+    desc: Format Go source files
+    cmds:
+      - gofmt -w .
+
+  vet:
+    desc: Run go vet
+    cmds:
+      - go vet ./...
+
+  check:
+    desc: Run formatting, tests, and static analysis
+    cmds:
+      - task: fmt
+      - task: test
+      - task: vet
+
+  clean:
+    desc: Remove build artifacts
+    cmds:
+      - rm -rf {{.BIN_DIR}}
