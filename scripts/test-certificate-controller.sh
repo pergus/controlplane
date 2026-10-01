@@ -1,17 +1,13 @@
 #!/usr/bin/env bash
 
 set -euo pipefail
-
-API="http://localhost:8080"
-KIND="Certificate"
+                "hostname": "${NAME}.example.internal",
 COUNT=20
 
 echo "Testing certificate controller with ${COUNT} resources"
 
 for i in $(seq 1 ${COUNT}); do
-    NAME="certificate-test-${i}"
-
-    curl -s -X POST "${API}/api/v1/${KIND}" \
+                "hostname": "updated-${NAME}.example.internal",
         -H "Content-Type: application/json" \
         -d "{
             \"apiVersion\": \"v1\",

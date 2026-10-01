@@ -92,10 +92,60 @@ func (s *SQLiteStore) migrate() error {
 			kind TEXT NOT NULL,
 			resource TEXT NOT NULL,
 			namespaced INTEGER NOT NULL,
+			schema TEXT NOT NULL DEFAULT '{}',
 			PRIMARY KEY(api_version, kind)
 		);
 	`)
 
+	if err != nil {
+		return err
+	}
+
+	return s.ensureKindSchemaColumn()
+}
+
+func (s *SQLiteStore) ensureKindSchemaColumn() error {
+	rows, err := s.db.Query("PRAGMA table_info(resource_kinds)")
+	if err != nil {
+		return err
+	}
+
+	hasSchema := false
+	for rows.Next() {
+		var (
+			columnID     int
+			name         string
+			columnType   string
+			notNull      int
+			defaultValue sql.NullString
+			primaryKey   int
+		)
+
+		if err := rows.Scan(&columnID, &name, &columnType, &notNull, &defaultValue, &primaryKey); err != nil {
+			rows.Close()
+			return err
+		}
+
+		if name == "schema" {
+			hasSchema = true
+		}
+	}
+
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return err
+	}
+	if err := rows.Close(); err != nil {
+		return err
+	}
+	if hasSchema {
+		return nil
+	}
+
+	_, err = s.db.Exec(`
+		ALTER TABLE resource_kinds
+		ADD COLUMN schema TEXT NOT NULL DEFAULT '{}'
+	`)
 	return err
 }
 
@@ -103,10 +153,7 @@ func (s *SQLiteStore) Close() error {
 	return s.db.Close()
 }
 
-func (s *SQLiteStore) Create(
-	ctx context.Context,
-	resource protocol.Resource,
-) (protocol.Resource, error) {
+func (s *SQLiteStore) Create(ctx context.Context, resource protocol.Resource) (protocol.Resource, error) {
 	labels, err := json.Marshal(resource.Metadata.Labels)
 	if err != nil {
 		return protocol.Resource{}, err
@@ -167,8 +214,7 @@ func (s *SQLiteStore) Create(
 	resource.Metadata.UID = uid
 	resource.Metadata.Generation = 1
 
-	resource.Metadata.ResourceVersion, err =
-		nextResourceVersion(ctx, tx)
+	resource.Metadata.ResourceVersion, err = nextResourceVersion(ctx, tx)
 
 	if err != nil {
 		return protocol.Resource{}, err
@@ -216,13 +262,7 @@ func (s *SQLiteStore) Create(
 	return resource, nil
 }
 
-func (s *SQLiteStore) Get(
-	ctx context.Context,
-	apiVersion string,
-	kind string,
-	namespace string,
-	name string,
-) (protocol.Resource, error) {
+func (s *SQLiteStore) Get(ctx context.Context, apiVersion, kind, namespace, name string) (protocol.Resource, error) {
 	row := s.db.QueryRowContext(
 		ctx,
 		`
@@ -253,10 +293,7 @@ func (s *SQLiteStore) Get(
 	return scanResource(row)
 }
 
-func (s *SQLiteStore) List(
-	ctx context.Context,
-	filter ResourceFilter,
-) ([]protocol.Resource, error) {
+func (s *SQLiteStore) List(ctx context.Context, filter ResourceFilter) ([]protocol.Resource, error) {
 	query := `
 		SELECT
 			api_version,
@@ -319,10 +356,7 @@ func (s *SQLiteStore) List(
 	return resources, nil
 }
 
-func (s *SQLiteStore) Update(
-	ctx context.Context,
-	resource protocol.Resource,
-) (protocol.Resource, error) {
+func (s *SQLiteStore) Update(ctx context.Context, resource protocol.Resource) (protocol.Resource, error) {
 	spec, err := json.Marshal(resource.Spec)
 	if err != nil {
 		return protocol.Resource{}, err
@@ -383,8 +417,7 @@ func (s *SQLiteStore) Update(
 	resource.Metadata.UID = uid
 	resource.Metadata.Generation = generation
 
-	resource.Metadata.ResourceVersion, err =
-		nextResourceVersion(ctx, tx)
+	resource.Metadata.ResourceVersion, err = nextResourceVersion(ctx, tx)
 
 	if err != nil {
 		return protocol.Resource{}, err
@@ -438,27 +471,14 @@ func (s *SQLiteStore) Update(
 	return resource, nil
 }
 
-func (s *SQLiteStore) Delete(
-	ctx context.Context,
-	apiVersion string,
-	kind string,
-	namespace string,
-	name string,
-) (protocol.Resource, error) {
+func (s *SQLiteStore) Delete(ctx context.Context, apiVersion, kind, namespace, name string) (protocol.Resource, error) {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return protocol.Resource{}, err
 	}
 	defer tx.Rollback()
 
-	resource, err := getSQLiteTx(
-		ctx,
-		tx,
-		apiVersion,
-		kind,
-		namespace,
-		name,
-	)
+	resource, err := getSQLiteTx(ctx, tx, apiVersion, kind, namespace, name)
 
 	if err != nil {
 		return protocol.Resource{}, err
@@ -490,49 +510,53 @@ func (s *SQLiteStore) Delete(
 	return resource, nil
 }
 
-func (s *SQLiteStore) RegisterKind(
-	ctx context.Context,
-	kind protocol.ResourceKind,
-) error {
-	_, err := s.db.ExecContext(
+func (s *SQLiteStore) RegisterKind(ctx context.Context, kind protocol.ResourceKind) error {
+	schemaJSON, err := json.Marshal(kind.Schema)
+	if err != nil {
+		return err
+	}
+	if kind.Schema == nil {
+		schemaJSON = []byte("{}")
+	}
+
+	_, err = s.db.ExecContext(
 		ctx,
 		`
 		INSERT INTO resource_kinds (
 			api_version,
 			kind,
 			resource,
-			namespaced
+			namespaced,
+			schema
 		)
-		VALUES (?, ?, ?, ?)
+		VALUES (?, ?, ?, ?, ?)
 		ON CONFLICT(api_version, kind)
 		DO UPDATE SET
 			resource = excluded.resource,
-			namespaced = excluded.namespaced
+			namespaced = excluded.namespaced,
+			schema = excluded.schema
 		`,
 		kind.APIVersion,
 		kind.Kind,
 		kind.Resource,
 		boolToInt(kind.Namespaced),
+		string(schemaJSON),
 	)
 
 	return err
 }
 
-func (s *SQLiteStore) ListKinds(
-	ctx context.Context,
-) ([]protocol.ResourceKind, error) {
-	rows, err := s.db.QueryContext(
-		ctx,
-		`
+func (s *SQLiteStore) ListKinds(ctx context.Context) ([]protocol.ResourceKind, error) {
+	rows, err := s.db.QueryContext(ctx, `
 		SELECT
 			api_version,
 			kind,
 			resource,
-			namespaced
+			namespaced,
+			schema
 		FROM resource_kinds
 		ORDER BY api_version, kind
-		`,
-	)
+		`)
 
 	if err != nil {
 		return nil, err
@@ -544,17 +568,16 @@ func (s *SQLiteStore) ListKinds(
 	for rows.Next() {
 		var kind protocol.ResourceKind
 		var namespaced int
+		var schemaJSON string
 
-		if err := rows.Scan(
-			&kind.APIVersion,
-			&kind.Kind,
-			&kind.Resource,
-			&namespaced,
-		); err != nil {
+		if err := rows.Scan(&kind.APIVersion, &kind.Kind, &kind.Resource, &namespaced, &schemaJSON); err != nil {
 			return nil, err
 		}
 
 		kind.Namespaced = namespaced != 0
+		if err := json.Unmarshal([]byte(schemaJSON), &kind.Schema); err != nil {
+			return nil, err
+		}
 		kinds = append(kinds, kind)
 	}
 
@@ -575,19 +598,7 @@ func scanResource(s scanner) (protocol.Resource, error) {
 		statusJSON      string
 	)
 
-	err := s.Scan(
-		&resource.APIVersion,
-		&resource.Kind,
-		&namespace,
-		&resource.Metadata.Name,
-		&resource.Metadata.UID,
-		&resource.Metadata.Generation,
-		&resource.Metadata.ResourceVersion,
-		&labelsJSON,
-		&annotationsJSON,
-		&specJSON,
-		&statusJSON,
-	)
+	err := s.Scan(&resource.APIVersion, &resource.Kind, &namespace, &resource.Metadata.Name, &resource.Metadata.UID, &resource.Metadata.Generation, &resource.Metadata.ResourceVersion, &labelsJSON, &annotationsJSON, &specJSON, &statusJSON)
 
 	if err != nil {
 		if errorsIsNoRows(err) {
@@ -599,45 +610,26 @@ func scanResource(s scanner) (protocol.Resource, error) {
 
 	resource.Metadata.Namespace = namespace
 
-	if err := json.Unmarshal(
-		[]byte(labelsJSON),
-		&resource.Metadata.Labels,
-	); err != nil {
+	if err := json.Unmarshal([]byte(labelsJSON), &resource.Metadata.Labels); err != nil {
 		return protocol.Resource{}, err
 	}
 
-	if err := json.Unmarshal(
-		[]byte(annotationsJSON),
-		&resource.Metadata.Annotations,
-	); err != nil {
+	if err := json.Unmarshal([]byte(annotationsJSON), &resource.Metadata.Annotations); err != nil {
 		return protocol.Resource{}, err
 	}
 
-	if err := json.Unmarshal(
-		[]byte(specJSON),
-		&resource.Spec,
-	); err != nil {
+	if err := json.Unmarshal([]byte(specJSON), &resource.Spec); err != nil {
 		return protocol.Resource{}, err
 	}
 
-	if err := json.Unmarshal(
-		[]byte(statusJSON),
-		&resource.Status,
-	); err != nil {
+	if err := json.Unmarshal([]byte(statusJSON), &resource.Status); err != nil {
 		return protocol.Resource{}, err
 	}
 
 	return resource, nil
 }
 
-func getSQLiteTx(
-	ctx context.Context,
-	tx *sql.Tx,
-	apiVersion string,
-	kind string,
-	namespace string,
-	name string,
-) (protocol.Resource, error) {
+func getSQLiteTx(ctx context.Context, tx *sql.Tx, apiVersion, kind, namespace, name string) (protocol.Resource, error) {
 	row := tx.QueryRowContext(
 		ctx,
 		`
@@ -668,20 +660,14 @@ func getSQLiteTx(
 	return scanResource(row)
 }
 
-func nextResourceVersion(
-	ctx context.Context,
-	tx *sql.Tx,
-) (uint64, error) {
+func nextResourceVersion(ctx context.Context, tx *sql.Tx) (uint64, error) {
 	var version uint64
 
-	err := tx.QueryRowContext(
-		ctx,
-		`
+	err := tx.QueryRowContext(ctx, `
 		SELECT value
 		FROM metadata
 		WHERE key = 'resource_version'
-		`,
-	).Scan(&version)
+		`).Scan(&version)
 
 	if err != nil {
 		return 0, err

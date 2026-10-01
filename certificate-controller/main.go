@@ -22,6 +22,15 @@ var certificateKind = protocol.ResourceKind{
 	Kind:       "Certificate",
 	Resource:   "certificates",
 	Namespaced: true,
+	Schema: map[string]any{
+		"type":     "object",
+		"required": []string{"hostname", "issuer"},
+		"properties": map[string]any{
+			"hostname": map[string]any{"type": "string", "minLength": 1},
+			"issuer":   map[string]any{"type": "string", "minLength": 1},
+		},
+		"additionalProperties": false,
+	},
 }
 
 func main() {
@@ -116,14 +125,7 @@ func reconcile(event protocol.WatchEvent) error {
 }
 
 func reconcileCertificate(resource protocol.Resource) error {
-	log.Printf(
-		"RECONCILE Certificate/%s generation=%d resourceVersion=%d hostname=%v issuer=%v",
-		resource.Metadata.Name,
-		resource.Metadata.Generation,
-		resource.Metadata.ResourceVersion,
-		resource.Spec["hostname"],
-		resource.Spec["issuer"],
-	)
+	log.Printf("RECONCILE Certificate/%s generation=%d resourceVersion=%d hostname=%v issuer=%v", resource.Metadata.Name, resource.Metadata.Generation, resource.Metadata.ResourceVersion, resource.Spec["hostname"], resource.Spec["issuer"])
 
 	// The real certificate implementation would reconcile the
 	// desired certificate state against the actual certificate.
@@ -143,12 +145,7 @@ func reconcileCertificate(resource protocol.Resource) error {
 }
 
 func removeCertificate(resource protocol.Resource) error {
-	log.Printf(
-		"DELETE Certificate/%s generation=%d resourceVersion=%d",
-		resource.Metadata.Name,
-		resource.Metadata.Generation,
-		resource.Metadata.ResourceVersion,
-	)
+	log.Printf("DELETE Certificate/%s generation=%d resourceVersion=%d", resource.Metadata.Name, resource.Metadata.Generation, resource.Metadata.ResourceVersion)
 
 	// Remove or clean up certificate-related external state here.
 	//

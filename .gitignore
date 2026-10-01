@@ -1,2 +1,5 @@
 bin/
+controlplane.db
+controlplane.db-shm
+controlplane.db-wal
 .DS_Store

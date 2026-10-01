@@ -17,6 +17,8 @@ import (
 
 	"controlplane/api-server/storage"
 	"controlplane/protocol"
+
+	"github.com/santhosh-tekuri/jsonschema/v5"
 )
 
 const (
@@ -66,17 +68,12 @@ func main() {
 
 	stop := make(chan os.Signal, 1)
 
-	signal.Notify(
-		stop,
-		os.Interrupt,
-		syscall.SIGTERM,
-	)
+	signal.Notify(stop, os.Interrupt, syscall.SIGTERM)
 
 	go func() {
 		log.Printf("API server listening on %s", httpServer.Addr)
 
-		if err := httpServer.ListenAndServe(); err != nil &&
-			!errors.Is(err, http.ErrServerClosed) {
+		if err := httpServer.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			log.Fatalf("API server failed: %v", err)
 		}
 	}()
@@ -85,10 +82,7 @@ func main() {
 
 	log.Println("shutting down API server")
 
-	ctx, cancel := context.WithTimeout(
-		context.Background(),
-		10*time.Second,
-	)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
 	if err := httpServer.Shutdown(ctx); err != nil {
@@ -97,16 +91,11 @@ func main() {
 }
 
 func createStore() (storage.ResourceStore, error) {
-	backend := strings.ToLower(
-		getEnv("STORAGE", "sqlite"),
-	)
+	backend := strings.ToLower(getEnv("STORAGE", "sqlite"))
 
 	switch backend {
 	case "sqlite":
-		path := getEnv(
-			"SQLITE_PATH",
-			defaultSQLitePath,
-		)
+		path := getEnv("SQLITE_PATH", defaultSQLitePath)
 
 		log.Printf("using SQLite storage: %s", path)
 
@@ -116,10 +105,7 @@ func createStore() (storage.ResourceStore, error) {
 		dsn := os.Getenv("POSTGRES_DSN")
 
 		if dsn == "" {
-			return nil, fmt.Errorf(
-				"POSTGRES_DSN must be set when STORAGE=%s",
-				backend,
-			)
+			return nil, fmt.Errorf("POSTGRES_DSN must be set when STORAGE=%s", backend)
 		}
 
 		log.Println("using PostgreSQL storage")
@@ -127,10 +113,7 @@ func createStore() (storage.ResourceStore, error) {
 		return storage.NewPostgres(dsn)
 
 	default:
-		return nil, fmt.Errorf(
-			"unknown storage backend %q",
-			backend,
-		)
+		return nil, fmt.Errorf("unknown storage backend %q", backend)
 	}
 }
 
@@ -144,14 +127,8 @@ func getEnv(name, fallback string) string {
 	return value
 }
 
-func (s *Server) ServeHTTP(
-	w http.ResponseWriter,
-	r *http.Request,
-) {
-	path := strings.Trim(
-		r.URL.Path,
-		"/",
-	)
+func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	path := strings.Trim(r.URL.Path, "/")
 
 	switch path {
 	case "api/v1/kinds":
@@ -183,33 +160,19 @@ func (s *Server) ServeHTTP(
 	kind := parts[2]
 
 	if len(parts) == 3 {
-		s.handleResourceCollection(
-			w,
-			r,
-			apiVersion,
-			kind,
-		)
+		s.handleResourceCollection(w, r, apiVersion, kind)
 		return
 	}
 
 	if len(parts) == 4 {
-		s.handleResource(
-			w,
-			r,
-			apiVersion,
-			kind,
-			parts[3],
-		)
+		s.handleResource(w, r, apiVersion, kind, parts[3])
 		return
 	}
 
 	http.NotFound(w, r)
 }
 
-func (s *Server) handleKinds(
-	w http.ResponseWriter,
-	r *http.Request,
-) {
+func (s *Server) handleKinds(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case http.MethodGet:
 		kinds, err := s.store.ListKinds(r.Context())
@@ -230,84 +193,48 @@ func (s *Server) handleKinds(
 		var kind protocol.ResourceKind
 
 		if err := decodeJSON(r, &kind); err != nil {
-			writeError(
-				w,
-				http.StatusBadRequest,
-				fmt.Errorf("invalid JSON: %w", err),
-			)
+			writeError(w, http.StatusBadRequest, fmt.Errorf("invalid JSON: %w", err))
 			return
 		}
 
-		if kind.APIVersion == "" ||
-			kind.Kind == "" ||
-			kind.Resource == "" {
-
-			writeError(
-				w,
-				http.StatusBadRequest,
-				errors.New(
-					"apiVersion, kind, and resource are required",
-				),
-			)
+		if kind.APIVersion == "" || kind.Kind == "" || kind.Resource == "" {
+			writeError(w, http.StatusBadRequest, errors.New("apiVersion, kind, and resource are required"))
 			return
 		}
 
-		if err := s.store.RegisterKind(
-			r.Context(),
-			kind,
-		); err != nil {
-			writeError(
-				w,
-				http.StatusInternalServerError,
-				err,
-			)
+		if _, err := compileResourceSchema(kind.Schema); err != nil {
+			writeError(w, http.StatusBadRequest, fmt.Errorf("invalid resource schema: %w", err))
+			return
+		}
+
+		if err := s.store.RegisterKind(r.Context(), kind); err != nil {
+			writeError(w, http.StatusInternalServerError, err)
 			return
 		}
 
 		writeJSON(w, http.StatusCreated, kind)
 
 	default:
-		w.Header().Set(
-			"Allow",
-			"GET, POST",
-		)
+		w.Header().Set("Allow", "GET, POST")
 
-		http.Error(
-			w,
-			"method not supported",
-			http.StatusMethodNotAllowed,
-		)
+		http.Error(w, "method not supported", http.StatusMethodNotAllowed)
 	}
 }
 
-func (s *Server) handleResources(
-	w http.ResponseWriter,
-	r *http.Request,
-) {
+func (s *Server) handleResources(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
-		http.Error(
-			w,
-			"method not supported",
-			http.StatusMethodNotAllowed,
-		)
+		http.Error(w, "method not supported", http.StatusMethodNotAllowed)
 		return
 	}
 
-	resources, err := s.store.List(
-		r.Context(),
-		storage.ResourceFilter{
-			APIVersion: r.URL.Query().Get("apiVersion"),
-			Kind:       r.URL.Query().Get("kind"),
-			Namespace:  r.URL.Query().Get("namespace"),
-		},
-	)
+	resources, err := s.store.List(r.Context(), storage.ResourceFilter{
+		APIVersion: r.URL.Query().Get("apiVersion"),
+		Kind:       r.URL.Query().Get("kind"),
+		Namespace:  r.URL.Query().Get("namespace"),
+	})
 
 	if err != nil {
-		writeError(
-			w,
-			http.StatusInternalServerError,
-			err,
-		)
+		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
 
@@ -320,113 +247,48 @@ func (s *Server) handleResources(
 	writeJSON(w, http.StatusOK, result)
 }
 
-func (s *Server) handleResourceCollection(
-	w http.ResponseWriter,
-	r *http.Request,
-	apiVersion string,
-	kind string,
-) {
+func (s *Server) handleResourceCollection(w http.ResponseWriter, r *http.Request, apiVersion, kind string) {
 	switch r.Method {
 	case http.MethodGet:
-		s.listResources(
-			w,
-			r,
-			apiVersion,
-			kind,
-		)
+		s.listResources(w, r, apiVersion, kind)
 
 	case http.MethodPost:
-		s.createResource(
-			w,
-			r,
-			apiVersion,
-			kind,
-		)
+		s.createResource(w, r, apiVersion, kind)
 
 	default:
-		w.Header().Set(
-			"Allow",
-			"GET, POST",
-		)
+		w.Header().Set("Allow", "GET, POST")
 
-		http.Error(
-			w,
-			"method not supported",
-			http.StatusMethodNotAllowed,
-		)
+		http.Error(w, "method not supported", http.StatusMethodNotAllowed)
 	}
 }
 
-func (s *Server) handleResource(
-	w http.ResponseWriter,
-	r *http.Request,
-	apiVersion string,
-	kind string,
-	name string,
-) {
+func (s *Server) handleResource(w http.ResponseWriter, r *http.Request, apiVersion, kind, name string) {
 	switch r.Method {
 	case http.MethodGet:
-		s.getResource(
-			w,
-			r,
-			apiVersion,
-			kind,
-			name,
-		)
+		s.getResource(w, r, apiVersion, kind, name)
 
 	case http.MethodPut:
-		s.updateResource(
-			w,
-			r,
-			apiVersion,
-			kind,
-			name,
-		)
+		s.updateResource(w, r, apiVersion, kind, name)
 
 	case http.MethodDelete:
-		s.deleteResource(
-			w,
-			r,
-			apiVersion,
-			kind,
-			name,
-		)
+		s.deleteResource(w, r, apiVersion, kind, name)
 
 	default:
-		w.Header().Set(
-			"Allow",
-			"GET, PUT, DELETE",
-		)
+		w.Header().Set("Allow", "GET, PUT, DELETE")
 
-		http.Error(
-			w,
-			"method not supported",
-			http.StatusMethodNotAllowed,
-		)
+		http.Error(w, "method not supported", http.StatusMethodNotAllowed)
 	}
 }
 
-func (s *Server) listResources(
-	w http.ResponseWriter,
-	r *http.Request,
-	apiVersion string,
-	kind string,
-) {
-	resources, err := s.store.List(
-		r.Context(),
-		storage.ResourceFilter{
-			APIVersion: apiVersion,
-			Kind:       kind,
-			Namespace:  r.URL.Query().Get("namespace"),
-		},
-	)
+func (s *Server) listResources(w http.ResponseWriter, r *http.Request, apiVersion, kind string) {
+	resources, err := s.store.List(r.Context(), storage.ResourceFilter{
+		APIVersion: apiVersion,
+		Kind:       kind,
+		Namespace:  r.URL.Query().Get("namespace"),
+	})
 
 	if err != nil {
-		writeError(
-			w,
-			http.StatusInternalServerError,
-			err,
-		)
+		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
 
@@ -439,20 +301,11 @@ func (s *Server) listResources(
 	writeJSON(w, http.StatusOK, result)
 }
 
-func (s *Server) createResource(
-	w http.ResponseWriter,
-	r *http.Request,
-	apiVersion string,
-	kind string,
-) {
+func (s *Server) createResource(w http.ResponseWriter, r *http.Request, apiVersion, kind string) {
 	var resource protocol.Resource
 
 	if err := decodeJSON(r, &resource); err != nil {
-		writeError(
-			w,
-			http.StatusBadRequest,
-			fmt.Errorf("invalid JSON: %w", err),
-		)
+		writeError(w, http.StatusBadRequest, fmt.Errorf("invalid JSON: %w", err))
 		return
 	}
 
@@ -464,103 +317,57 @@ func (s *Server) createResource(
 		resource.Kind = kind
 	}
 
-	if resource.APIVersion != apiVersion ||
-		resource.Kind != kind {
-
-		writeError(
-			w,
-			http.StatusBadRequest,
-			errors.New(
-				"resource apiVersion/kind does not match URL",
-			),
-		)
+	if resource.APIVersion != apiVersion || resource.Kind != kind {
+		writeError(w, http.StatusBadRequest, errors.New("resource apiVersion/kind does not match URL"))
 		return
 	}
 
 	if resource.Metadata.Name == "" {
-		writeError(
-			w,
-			http.StatusBadRequest,
-			errors.New("metadata.name is required"),
-		)
+		writeError(w, http.StatusBadRequest, errors.New("metadata.name is required"))
 		return
 	}
 
-	if err := s.ensureKind(
-		r.Context(),
-		apiVersion,
-		kind,
-	); err != nil {
+	registeredKind, err := s.getKind(r.Context(), apiVersion, kind)
+	if err != nil {
 		writeStorageError(w, err)
 		return
 	}
+	if err := validateResourceSpec(registeredKind.Schema, resource.Spec); err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
 
-	created, err := s.store.Create(
-		r.Context(),
-		resource,
-	)
+	created, err := s.store.Create(r.Context(), resource)
 
 	if err != nil {
 		writeStorageError(w, err)
 		return
 	}
 
-	s.broadcast(
-		protocol.WatchEvent{
-			Type:   protocol.Added,
-			Object: created,
-		},
-	)
+	s.broadcast(protocol.WatchEvent{
+		Type:   protocol.Added,
+		Object: created,
+	})
 
-	writeJSON(
-		w,
-		http.StatusCreated,
-		created,
-	)
+	writeJSON(w, http.StatusCreated, created)
 }
 
-func (s *Server) getResource(
-	w http.ResponseWriter,
-	r *http.Request,
-	apiVersion string,
-	kind string,
-	name string,
-) {
-	resource, err := s.store.Get(
-		r.Context(),
-		apiVersion,
-		kind,
-		r.URL.Query().Get("namespace"),
-		name,
-	)
+func (s *Server) getResource(w http.ResponseWriter, r *http.Request, apiVersion, kind, name string) {
+	resource, err := s.store.Get(r.Context(), apiVersion, kind, r.URL.Query().Get("namespace"), name)
 
 	if err != nil {
 		writeStorageError(w, err)
 		return
 	}
 
-	writeJSON(
-		w,
-		http.StatusOK,
-		resource,
-	)
+	writeJSON(w, http.StatusOK, resource)
 }
 
-func (s *Server) updateResource(
-	w http.ResponseWriter,
-	r *http.Request,
-	apiVersion string,
-	kind string,
-	name string,
-) {
+func (s *Server) updateResource(w http.ResponseWriter, r *http.Request, apiVersion, kind, name string) {
 	var resource protocol.Resource
 
 	if err := decodeJSON(r, &resource); err != nil {
-		writeError(
-			w,
-			http.StatusBadRequest,
-			fmt.Errorf("invalid JSON: %w", err),
-		)
+		writeError(w, http.StatusBadRequest, fmt.Errorf("invalid JSON: %w", err))
 		return
 	}
 
@@ -568,103 +375,97 @@ func (s *Server) updateResource(
 	resource.Kind = kind
 	resource.Metadata.Name = name
 
-	if err := s.ensureKind(
-		r.Context(),
-		apiVersion,
-		kind,
-	); err != nil {
+	registeredKind, err := s.getKind(r.Context(), apiVersion, kind)
+	if err != nil {
 		writeStorageError(w, err)
 		return
 	}
+	if err := validateResourceSpec(registeredKind.Schema, resource.Spec); err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
 
-	updated, err := s.store.Update(
-		r.Context(),
-		resource,
-	)
+	updated, err := s.store.Update(r.Context(), resource)
 
 	if err != nil {
 		writeStorageError(w, err)
 		return
 	}
 
-	s.broadcast(
-		protocol.WatchEvent{
-			Type:   protocol.Modified,
-			Object: updated,
-		},
-	)
+	s.broadcast(protocol.WatchEvent{
+		Type:   protocol.Modified,
+		Object: updated,
+	})
 
-	writeJSON(
-		w,
-		http.StatusOK,
-		updated,
-	)
+	writeJSON(w, http.StatusOK, updated)
 }
 
-func (s *Server) deleteResource(
-	w http.ResponseWriter,
-	r *http.Request,
-	apiVersion string,
-	kind string,
-	name string,
-) {
-	resource, err := s.store.Delete(
-		r.Context(),
-		apiVersion,
-		kind,
-		r.URL.Query().Get("namespace"),
-		name,
-	)
+func (s *Server) deleteResource(w http.ResponseWriter, r *http.Request, apiVersion, kind, name string) {
+	resource, err := s.store.Delete(r.Context(), apiVersion, kind, r.URL.Query().Get("namespace"), name)
 
 	if err != nil {
 		writeStorageError(w, err)
 		return
 	}
 
-	s.broadcast(
-		protocol.WatchEvent{
-			Type:   protocol.Deleted,
-			Object: resource,
-		},
-	)
+	s.broadcast(protocol.WatchEvent{
+		Type:   protocol.Deleted,
+		Object: resource,
+	})
 
-	writeJSON(
-		w,
-		http.StatusOK,
-		resource,
-	)
+	writeJSON(w, http.StatusOK, resource)
 }
 
-func (s *Server) ensureKind(
-	ctx context.Context,
-	apiVersion string,
-	kind string,
-) error {
+func (s *Server) getKind(ctx context.Context, apiVersion, kind string) (protocol.ResourceKind, error) {
 	kinds, err := s.store.ListKinds(ctx)
 	if err != nil {
-		return err
+		return protocol.ResourceKind{}, err
 	}
 
 	for _, registered := range kinds {
-		if registered.APIVersion == apiVersion &&
-			registered.Kind == kind {
-			return nil
+		if registered.APIVersion == apiVersion && registered.Kind == kind {
+			return registered, nil
 		}
 	}
 
-	return storage.ErrKindNotFound
+	return protocol.ResourceKind{}, storage.ErrKindNotFound
 }
 
-func (s *Server) handleWatch(
-	w http.ResponseWriter,
-	r *http.Request,
-) {
+func compileResourceSchema(definition map[string]any) (*jsonschema.Schema, error) {
+	if len(definition) == 0 {
+		return nil, nil
+	}
+
+	encoded, err := json.Marshal(definition)
+	if err != nil {
+		return nil, err
+	}
+
+	compiler := jsonschema.NewCompiler()
+	if err := compiler.AddResource("resource-schema.json", strings.NewReader(string(encoded))); err != nil {
+		return nil, err
+	}
+
+	return compiler.Compile("resource-schema.json")
+}
+
+func validateResourceSpec(definition, spec map[string]any) error {
+	schema, err := compileResourceSchema(definition)
+	if err != nil {
+		return fmt.Errorf("%w: invalid registered schema: %v", storage.ErrInvalidResource, err)
+	}
+	if schema == nil {
+		return nil
+	}
+	if err := schema.Validate(spec); err != nil {
+		return fmt.Errorf("%w: spec: %v", storage.ErrInvalidResource, err)
+	}
+	return nil
+}
+
+func (s *Server) handleWatch(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
-		http.Error(
-			w,
-			"method not supported",
-			http.StatusMethodNotAllowed,
-		)
+		http.Error(w, "method not supported", http.StatusMethodNotAllowed)
 		return
 	}
 
@@ -674,40 +475,18 @@ func (s *Server) handleWatch(
 
 	flusher, ok := w.(http.Flusher)
 	if !ok {
-		http.Error(
-			w,
-			"streaming unsupported",
-			http.StatusInternalServerError,
-		)
+		http.Error(w, "streaming unsupported", http.StatusInternalServerError)
 		return
 	}
 
-	w.Header().Set(
-		"Content-Type",
-		"application/x-ndjson",
-	)
-	w.Header().Set(
-		"Cache-Control",
-		"no-cache",
-	)
-	w.Header().Set(
-		"Connection",
-		"keep-alive",
-	)
+	w.Header().Set("Content-Type", "application/x-ndjson")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
 
-	watcher, snapshot, err := s.addWatcher(
-		r.Context(),
-		apiVersion,
-		kind,
-		namespace,
-	)
+	watcher, snapshot, err := s.addWatcher(r.Context(), apiVersion, kind, namespace)
 
 	if err != nil {
-		writeError(
-			w,
-			http.StatusInternalServerError,
-			err,
-		)
+		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
 
@@ -716,12 +495,10 @@ func (s *Server) handleWatch(
 	encoder := json.NewEncoder(w)
 
 	for _, resource := range snapshot {
-		if err := encoder.Encode(
-			protocol.WatchEvent{
-				Type:   protocol.Added,
-				Object: resource,
-			},
-		); err != nil {
+		if err := encoder.Encode(protocol.WatchEvent{
+			Type:   protocol.Added,
+			Object: resource,
+		}); err != nil {
 			return
 		}
 
@@ -748,9 +525,7 @@ func (s *Server) handleWatch(
 
 func (s *Server) addWatcher(
 	ctx context.Context,
-	apiVersion string,
-	kind string,
-	namespace string,
+	apiVersion, kind, namespace string,
 ) (*Watcher, []protocol.Resource, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -768,14 +543,11 @@ func (s *Server) addWatcher(
 
 	s.watchers[watcher.id] = watcher
 
-	snapshot, err := s.store.List(
-		ctx,
-		storage.ResourceFilter{
-			APIVersion: apiVersion,
-			Kind:       kind,
-			Namespace:  namespace,
-		},
-	)
+	snapshot, err := s.store.List(ctx, storage.ResourceFilter{
+		APIVersion: apiVersion,
+		Kind:       kind,
+		Namespace:  namespace,
+	})
 
 	if err != nil {
 		delete(s.watchers, watcher.id)
@@ -792,110 +564,66 @@ func (s *Server) removeWatcher(id uint64) {
 	delete(s.watchers, id)
 }
 
-func (s *Server) broadcast(
-	event protocol.WatchEvent,
-) {
+func (s *Server) broadcast(event protocol.WatchEvent) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	for _, watcher := range s.watchers {
-		if watcher.apiVersion != "" &&
-			watcher.apiVersion != event.Object.APIVersion {
+		if watcher.apiVersion != "" && watcher.apiVersion != event.Object.APIVersion {
 			continue
 		}
 
-		if watcher.kind != "" &&
-			watcher.kind != event.Object.Kind {
+		if watcher.kind != "" && watcher.kind != event.Object.Kind {
 			continue
 		}
 
-		if watcher.namespace != "" &&
-			watcher.namespace != event.Object.Metadata.Namespace {
+		if watcher.namespace != "" && watcher.namespace != event.Object.Metadata.Namespace {
 			continue
 		}
 
 		select {
 		case watcher.events <- event:
 		default:
-			log.Printf(
-				"watcher %d event buffer full",
-				watcher.id,
-			)
+			log.Printf("watcher %d event buffer full", watcher.id)
 		}
 	}
 }
 
-func decodeJSON(
-	r *http.Request,
-	value any,
-) error {
-	decoder := json.NewDecoder(
-		bufio.NewReader(r.Body),
-	)
+func decodeJSON(r *http.Request, value any) error {
+	decoder := json.NewDecoder(bufio.NewReader(r.Body))
 
 	decoder.DisallowUnknownFields()
 
 	return decoder.Decode(value)
 }
 
-func writeJSON(
-	w http.ResponseWriter,
-	status int,
-	value any,
-) {
-	w.Header().Set(
-		"Content-Type",
-		"application/json",
-	)
+func writeJSON(w http.ResponseWriter, status int, value any) {
+	w.Header().Set("Content-Type", "application/json")
 
 	w.WriteHeader(status)
 
 	_ = json.NewEncoder(w).Encode(value)
 }
 
-func writeError(
-	w http.ResponseWriter,
-	status int,
-	err error,
-) {
-	http.Error(
-		w,
-		err.Error(),
-		status,
-	)
+func writeError(w http.ResponseWriter, status int, err error) {
+	http.Error(w, err.Error(), status)
 }
 
-func writeStorageError(
-	w http.ResponseWriter,
-	err error,
-) {
+func writeStorageError(w http.ResponseWriter, err error) {
 	switch {
 	case errors.Is(err, storage.ErrNotFound):
-		writeError(
-			w,
-			http.StatusNotFound,
-			err,
-		)
+		writeError(w, http.StatusNotFound, err)
 
 	case errors.Is(err, storage.ErrAlreadyExists):
-		writeError(
-			w,
-			http.StatusConflict,
-			err,
-		)
+		writeError(w, http.StatusConflict, err)
 
 	case errors.Is(err, storage.ErrKindNotFound):
-		writeError(
-			w,
-			http.StatusNotFound,
-			err,
-		)
+		writeError(w, http.StatusNotFound, err)
+
+	case errors.Is(err, storage.ErrInvalidResource):
+		writeError(w, http.StatusBadRequest, err)
 
 	default:
-		writeError(
-			w,
-			http.StatusInternalServerError,
-			err,
-		)
+		writeError(w, http.StatusInternalServerError, err)
 	}
 }

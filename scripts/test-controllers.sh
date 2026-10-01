@@ -129,6 +129,7 @@ log
 create_resources() {
     local api_version=$1
     local kind=$2
+    local spec
 
     CREATED[$kind]=0
 
@@ -136,6 +137,18 @@ create_resources() {
 
     for i in $(seq 1 "$COUNT"); do
         local name="controller-test-${i}"
+
+        case "$kind" in
+            DNSRecord)
+                spec="{\"hostname\":\"${name}.example.test\",\"address\":\"192.0.2.10\"}"
+                ;;
+            Certificate)
+                spec="{\"hostname\":\"${name}.example.test\",\"issuer\":\"internal-ca\"}"
+                ;;
+            *)
+                spec="{\"name\":\"${name}\"}"
+                ;;
+        esac
 
         if curl \
             --connect-timeout 2 \
@@ -150,9 +163,7 @@ create_resources() {
                 \"metadata\":{
                     \"name\":\"${name}\"
                 },
-                \"spec\":{
-                    \"name\":\"${name}\"
-                }
+                "spec":${spec}
             }" >/dev/null; then
 
             CREATED[$kind]=$((CREATED[$kind] + 1))
@@ -167,6 +178,7 @@ create_resources() {
 update_resources() {
     local api_version=$1
     local kind=$2
+    local spec
 
     UPDATED[$kind]=0
 
@@ -174,6 +186,18 @@ update_resources() {
 
     for i in $(seq 1 "$COUNT"); do
         local name="controller-test-${i}"
+
+        case "$kind" in
+            DNSRecord)
+                spec="{\"hostname\":\"updated-${name}.example.test\",\"address\":\"192.0.2.11\"}"
+                ;;
+            Certificate)
+                spec="{\"hostname\":\"updated-${name}.example.test\",\"issuer\":\"internal-ca\"}"
+                ;;
+            *)
+                spec="{\"name\":\"${name}\",\"updated\":true}"
+                ;;
+        esac
 
         if curl \
             --connect-timeout 2 \
@@ -188,10 +212,7 @@ update_resources() {
                 \"metadata\":{
                     \"name\":\"${name}\"
                 },
-                \"spec\":{
-                    \"name\":\"${name}\",
-                    \"updated\":true
-                }
+                "spec":${spec}
             }" >/dev/null; then
 
             UPDATED[$kind]=$((UPDATED[$kind] + 1))

@@ -4,6 +4,7 @@ go 1.26.5
 
 require (
 	github.com/jackc/pgx/v5 v5.11.0
+	github.com/santhosh-tekuri/jsonschema/v5 v5.3.1
 	modernc.org/sqlite v1.60.1
 )
 

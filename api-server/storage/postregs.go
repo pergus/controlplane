@@ -88,17 +88,18 @@ func (s *PostgresStore) migrate() error {
 			kind TEXT NOT NULL,
 			resource TEXT NOT NULL,
 			namespaced BOOLEAN NOT NULL,
+			schema JSONB NOT NULL DEFAULT '{}'::jsonb,
 			PRIMARY KEY(api_version, kind)
 		);
+
+		ALTER TABLE resource_kinds
+		ADD COLUMN IF NOT EXISTS schema JSONB NOT NULL DEFAULT '{}'::jsonb;
 	`)
 
 	return err
 }
 
-func (s *PostgresStore) Create(
-	ctx context.Context,
-	resource protocol.Resource,
-) (protocol.Resource, error) {
+func (s *PostgresStore) Create(ctx context.Context, resource protocol.Resource) (protocol.Resource, error) {
 	labels, err := json.Marshal(resource.Metadata.Labels)
 	if err != nil {
 		return protocol.Resource{}, err
@@ -133,8 +134,7 @@ func (s *PostgresStore) Create(
 	resource.Metadata.UID = uid
 	resource.Metadata.Generation = 1
 
-	resource.Metadata.ResourceVersion, err =
-		nextPostgresResourceVersion(ctx, tx)
+	resource.Metadata.ResourceVersion, err = nextPostgresResourceVersion(ctx, tx)
 
 	if err != nil {
 		return protocol.Resource{}, err
@@ -186,13 +186,7 @@ func (s *PostgresStore) Create(
 	return resource, nil
 }
 
-func (s *PostgresStore) Get(
-	ctx context.Context,
-	apiVersion string,
-	kind string,
-	namespace string,
-	name string,
-) (protocol.Resource, error) {
+func (s *PostgresStore) Get(ctx context.Context, apiVersion, kind, namespace, name string) (protocol.Resource, error) {
 	row := s.db.QueryRowContext(
 		ctx,
 		`
@@ -223,10 +217,7 @@ func (s *PostgresStore) Get(
 	return scanPostgresResource(row)
 }
 
-func (s *PostgresStore) List(
-	ctx context.Context,
-	filter ResourceFilter,
-) ([]protocol.Resource, error) {
+func (s *PostgresStore) List(ctx context.Context, filter ResourceFilter) ([]protocol.Resource, error) {
 	query := `
 		SELECT
 			api_version,
@@ -288,10 +279,7 @@ func (s *PostgresStore) List(
 	return resources, rows.Err()
 }
 
-func (s *PostgresStore) Update(
-	ctx context.Context,
-	resource protocol.Resource,
-) (protocol.Resource, error) {
+func (s *PostgresStore) Update(ctx context.Context, resource protocol.Resource) (protocol.Resource, error) {
 	spec, err := json.Marshal(resource.Spec)
 	if err != nil {
 		return protocol.Resource{}, err
@@ -353,8 +341,7 @@ func (s *PostgresStore) Update(
 	resource.Metadata.UID = uid
 	resource.Metadata.Generation = generation
 
-	resource.Metadata.ResourceVersion, err =
-		nextPostgresResourceVersion(ctx, tx)
+	resource.Metadata.ResourceVersion, err = nextPostgresResourceVersion(ctx, tx)
 
 	if err != nil {
 		return protocol.Resource{}, err
@@ -399,27 +386,14 @@ func (s *PostgresStore) Update(
 	return resource, nil
 }
 
-func (s *PostgresStore) Delete(
-	ctx context.Context,
-	apiVersion string,
-	kind string,
-	namespace string,
-	name string,
-) (protocol.Resource, error) {
+func (s *PostgresStore) Delete(ctx context.Context, apiVersion, kind, namespace, name string) (protocol.Resource, error) {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return protocol.Resource{}, err
 	}
 	defer tx.Rollback()
 
-	resource, err := getPostgresTx(
-		ctx,
-		tx,
-		apiVersion,
-		kind,
-		namespace,
-		name,
-	)
+	resource, err := getPostgresTx(ctx, tx, apiVersion, kind, namespace, name)
 
 	if err != nil {
 		return protocol.Resource{}, err
@@ -451,49 +425,53 @@ func (s *PostgresStore) Delete(
 	return resource, nil
 }
 
-func (s *PostgresStore) RegisterKind(
-	ctx context.Context,
-	kind protocol.ResourceKind,
-) error {
-	_, err := s.db.ExecContext(
+func (s *PostgresStore) RegisterKind(ctx context.Context, kind protocol.ResourceKind) error {
+	schemaJSON, err := json.Marshal(kind.Schema)
+	if err != nil {
+		return err
+	}
+	if kind.Schema == nil {
+		schemaJSON = []byte("{}")
+	}
+
+	_, err = s.db.ExecContext(
 		ctx,
 		`
 		INSERT INTO resource_kinds (
 			api_version,
 			kind,
 			resource,
-			namespaced
+			namespaced,
+			schema
 		)
-		VALUES ($1, $2, $3, $4)
+		VALUES ($1, $2, $3, $4, $5)
 		ON CONFLICT(api_version, kind)
 		DO UPDATE SET
 			resource = EXCLUDED.resource,
-			namespaced = EXCLUDED.namespaced
+			namespaced = EXCLUDED.namespaced,
+			schema = EXCLUDED.schema
 		`,
 		kind.APIVersion,
 		kind.Kind,
 		kind.Resource,
 		kind.Namespaced,
+		schemaJSON,
 	)
 
 	return err
 }
 
-func (s *PostgresStore) ListKinds(
-	ctx context.Context,
-) ([]protocol.ResourceKind, error) {
-	rows, err := s.db.QueryContext(
-		ctx,
-		`
+func (s *PostgresStore) ListKinds(ctx context.Context) ([]protocol.ResourceKind, error) {
+	rows, err := s.db.QueryContext(ctx, `
 		SELECT
 			api_version,
 			kind,
 			resource,
-			namespaced
+			namespaced,
+			schema
 		FROM resource_kinds
 		ORDER BY api_version, kind
-		`,
-	)
+		`)
 
 	if err != nil {
 		return nil, err
@@ -504,13 +482,12 @@ func (s *PostgresStore) ListKinds(
 
 	for rows.Next() {
 		var kind protocol.ResourceKind
+		var schemaJSON []byte
 
-		if err := rows.Scan(
-			&kind.APIVersion,
-			&kind.Kind,
-			&kind.Resource,
-			&kind.Namespaced,
-		); err != nil {
+		if err := rows.Scan(&kind.APIVersion, &kind.Kind, &kind.Resource, &kind.Namespaced, &schemaJSON); err != nil {
+			return nil, err
+		}
+		if err := json.Unmarshal(schemaJSON, &kind.Schema); err != nil {
 			return nil, err
 		}
 
@@ -530,19 +507,7 @@ func scanPostgresResource(s scanner) (protocol.Resource, error) {
 		statusJSON      []byte
 	)
 
-	err := s.Scan(
-		&resource.APIVersion,
-		&resource.Kind,
-		&namespace,
-		&resource.Metadata.Name,
-		&resource.Metadata.UID,
-		&resource.Metadata.Generation,
-		&resource.Metadata.ResourceVersion,
-		&labelsJSON,
-		&annotationsJSON,
-		&specJSON,
-		&statusJSON,
-	)
+	err := s.Scan(&resource.APIVersion, &resource.Kind, &namespace, &resource.Metadata.Name, &resource.Metadata.UID, &resource.Metadata.Generation, &resource.Metadata.ResourceVersion, &labelsJSON, &annotationsJSON, &specJSON, &statusJSON)
 
 	if err != nil {
 		if err == sql.ErrNoRows {
@@ -581,14 +546,7 @@ func scanPostgresResource(s scanner) (protocol.Resource, error) {
 	return resource, nil
 }
 
-func getPostgresTx(
-	ctx context.Context,
-	tx *sql.Tx,
-	apiVersion string,
-	kind string,
-	namespace string,
-	name string,
-) (protocol.Resource, error) {
+func getPostgresTx(ctx context.Context, tx *sql.Tx, apiVersion, kind, namespace, name string) (protocol.Resource, error) {
 	row := tx.QueryRowContext(
 		ctx,
 		`
@@ -620,21 +578,15 @@ func getPostgresTx(
 	return scanPostgresResource(row)
 }
 
-func nextPostgresResourceVersion(
-	ctx context.Context,
-	tx *sql.Tx,
-) (uint64, error) {
+func nextPostgresResourceVersion(ctx context.Context, tx *sql.Tx) (uint64, error) {
 	var version uint64
 
-	err := tx.QueryRowContext(
-		ctx,
-		`
+	err := tx.QueryRowContext(ctx, `
 		SELECT value
 		FROM metadata
 		WHERE key = 'resource_version'
 		FOR UPDATE
-		`,
-	).Scan(&version)
+		`).Scan(&version)
 
 	if err != nil {
 		return 0, err

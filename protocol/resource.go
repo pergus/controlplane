@@ -19,10 +19,11 @@ type Metadata struct {
 }
 
 type ResourceKind struct {
-	APIVersion string `json:"apiVersion"`
-	Kind       string `json:"kind"`
-	Resource   string `json:"resource"`
-	Namespaced bool   `json:"namespaced"`
+	APIVersion string         `json:"apiVersion"`
+	Kind       string         `json:"kind"`
+	Resource   string         `json:"resource"`
+	Namespaced bool           `json:"namespaced"`
+	Schema     map[string]any `json:"schema,omitempty"`
 }
 
 type ResourceKindList struct {

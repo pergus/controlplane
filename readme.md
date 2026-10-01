@@ -1,6 +1,6 @@
 # Controlplane User Guide
 
-## 1. Introduction
+## Introduction
 
 Controlplane is a small and generic control plane written in Go.
 
@@ -27,11 +27,11 @@ The guide uses simple language and short instructions. You do not need advanced 
 
 ---
 
-# 2. System Overview
+# System Overview
 
 The system has three main parts:
 
-```text
+```
                     +----------------------+
                     |      API Server      |
                     |                      |
@@ -74,11 +74,11 @@ This separation is one of the most important design rules in Controlplane.
 
 ---
 
-# 3. Project Structure
+# Project Structure
 
 The project has this structure:
 
-```text
+```
 controlplane/
 ├── Taskfile.yml
 ├── go.mod
@@ -87,7 +87,11 @@ controlplane/
 │   └── resource.go
 │
 ├── api-server/
-│   └── main.go
+│   ├── main.go
+│   └── storage/
+│       ├── storage.go
+│       ├── sqlite.go
+│       └── postregs.go
 │
 ├── dns-controller/
 │   └── main.go
@@ -98,7 +102,7 @@ controlplane/
 
 Each directory has a specific purpose.
 
-## 3.1 `protocol`
+## `protocol`
 
 The `protocol` package contains the shared data structures.
 
@@ -128,7 +132,7 @@ It must not contain controller logic.
 
 The dependency direction is:
 
-```text
+```
 protocol
    ^
    |
@@ -143,13 +147,13 @@ This makes the protocol reusable.
 
 ---
 
-# 4. Resources
+# Resources
 
 A resource represents desired state.
 
 A resource has five main parts:
 
-```text
+```
 apiVersion
 kind
 metadata
@@ -174,7 +178,7 @@ Example:
 }
 ```
 
-## 4.1 `apiVersion`
+## `apiVersion`
 
 `apiVersion` identifies the API version.
 
@@ -192,7 +196,7 @@ The controller identifies resources by their `kind`.
 
 ---
 
-## 4.2 `kind`
+## `kind`
 
 `kind` identifies the type of resource.
 
@@ -212,7 +216,7 @@ A controller normally watches one or more kinds.
 
 For example:
 
-```text
+```
 DNSRecord
     |
     +-- DNS controller
@@ -224,7 +228,7 @@ Certificate
 
 ---
 
-## 4.3 `metadata`
+## `metadata`
 
 Metadata identifies a resource.
 
@@ -275,7 +279,7 @@ Example:
 
 A resource can therefore be identified by:
 
-```text
+```
 apiVersion
 kind
 namespace
@@ -308,9 +312,7 @@ A controller can use the generation to determine which desired configuration it 
 
 The resource version changes when the resource changes.
 
-It is managed by the API server.
-
-It is useful for observing resource changes and for future concurrency control.
+It is managed by the API server and is useful for observing changes and for future concurrency control.
 
 ### `labels`
 
@@ -327,9 +329,7 @@ Example:
 
 ### `annotations`
 
-Annotations are also key/value metadata.
-
-They are intended for additional information.
+Annotations are also key/value metadata. They are intended for additional information.
 
 Example:
 
@@ -339,13 +339,14 @@ Example:
 }
 ```
 
+
 ---
 
-# 5. `spec`
+# `spec`
 
 `spec` contains the desired state.
 
-The API server does not interpret the contents of `spec`.
+The API server validates `spec` against the JSON Schema registered for its resource kind. It does not apply controller-specific meaning or reconcile the requested state.
 
 For example:
 
@@ -356,9 +357,9 @@ For example:
 }
 ```
 
-The API server stores this data.
+The API server checks that this data matches the kind's schema, then stores it.
 
-The DNS controller interprets it.
+The DNS controller interprets its meaning and reconciles it.
 
 This is an important design rule.
 
@@ -368,7 +369,7 @@ A controller owns the meaning of its resource.
 
 For a DNS controller:
 
-```text
+```
 spec.hostname
 spec.address
 ```
@@ -377,18 +378,18 @@ may define a DNS record.
 
 For a certificate controller:
 
-```text
+```
 spec.hostname
 spec.issuer
 ```
 
 may define a certificate request.
 
-The API server does not need to know this.
+The API server knows each kind's schema, but does not need to know what valid values mean to the controller.
 
 ---
 
-# 6. `status`
+# `status`
 
 `status` represents observed state.
 
@@ -404,7 +405,7 @@ The current example controllers only log reconciliation activity. They do not ye
 
 A future controller can use status to report information such as:
 
-```text
+```
 ready
 error
 message
@@ -415,7 +416,7 @@ DNS propagation state
 
 The important distinction is:
 
-```text
+```
 spec   = desired state
 
 status = observed state
@@ -441,7 +442,7 @@ This means:
 
 ---
 
-# 7. Resource Kinds
+# Resource Kinds
 
 The API server supports dynamic resource-kind registration.
 
@@ -449,12 +450,37 @@ A resource kind is described by:
 
 ```go
 type ResourceKind struct {
-    APIVersion string `json:"apiVersion"`
-    Kind       string `json:"kind"`
-    Resource   string `json:"resource"`
-    Namespaced bool   `json:"namespaced"`
+    APIVersion string         `json:"apiVersion"`
+    Kind       string         `json:"kind"`
+    Resource   string         `json:"resource"`
+    Namespaced bool           `json:"namespaced"`
+    Schema     map[string]any `json:"schema,omitempty"`
 }
 ```
+
+`schema` is an optional JSON Schema for the resource's `spec`. The API server compiles the schema when the kind is registered, then validates every create and update before saving the resource or publishing a watch event. If no schema is registered, the API server performs no schema-based validation of `spec`.
+
+For example, a DNS record kind can require a hostname and address:
+
+```json
+{
+  "apiVersion": "v1",
+  "kind": "DNSRecord",
+  "resource": "dnsrecords",
+  "namespaced": true,
+  "schema": {
+    "type": "object",
+    "required": ["hostname", "address"],
+    "properties": {
+      "hostname": { "type": "string", "minLength": 1 },
+      "address": { "type": "string", "minLength": 1 }
+    },
+    "additionalProperties": false
+  }
+}
+```
+
+The schema validates structure and basic constraints. Controllers still own domain-specific checks, external-system constraints, and reconciliation behavior.
 
 Example:
 
@@ -498,19 +524,19 @@ Instead, a new controller registers its own resource kind.
 
 ---
 
-# 8. API Server
+# API Server
 
 The API server is the central process.
 
 The current server listens on:
 
-```text
+```
 http://localhost:8080
 ```
 
 The API server provides four main functions:
 
-```text
+```
 1. Resource kind discovery
 2. Resource CRUD
 3. Resource listing
@@ -519,131 +545,100 @@ The API server provides four main functions:
 
 CRUD means:
 
-```text
+```
 Create
 Read
 Update
 Delete
 ```
 
-The API server currently stores data in memory.
-
-If the API server stops, the resources are lost.
-
-This is intentional in the current simple implementation.
-
-A persistent database can be added later.
+The API server stores resources and kind registrations through the `ResourceStore` interface. SQLite is the default backend, and PostgreSQL is also supported. Active watch connections remain in API-server memory and reconnect after a restart.
 
 ---
 
-# 9. API Server Store
+# API Server Store
 
-The API server has an internal store.
+The API server uses `ResourceStore` for persisted resources and kind registrations. Active watchers are kept in API-server memory.
 
-Conceptually, the store contains:
+The API server keeps this storage interface and watcher registry:
 
 ```go
-type Store struct {
-    mu       sync.RWMutex
-    revision uint64
-    watchID  uint64
-    items    map[string]protocol.Resource
-    kinds    map[string]protocol.ResourceKind
-    watchers map[uint64]*Watcher
+type Server struct {
+  store    storage.ResourceStore
+  mu       sync.Mutex
+  watchID  uint64
+  watchers map[uint64]*Watcher
 }
 ```
 
-The store has three important maps.
+The database stores resources and kinds. The `Server` structure holds active watcher connections.
 
-## 9.1 Resources
+## Resources
 
-```text
-items
-```
-
-contains the resources.
-
-The resource key contains information such as:
-
-```text
-apiVersion
-kind
-namespace
-name
-```
-
-This allows resources with the same name to exist in different namespaces.
+Resources are stored by `apiVersion`, `kind`, `namespace`, and `name`, so different kinds and namespaces can reuse a name.
 
 ---
 
-## 9.2 Kinds
+## Kinds
 
-```text
+```
 kinds
 ```
 
-contains registered resource kinds.
+describes registered resource kinds and their optional `spec` schemas. These definitions are persisted by the storage backend.
 
 For example:
 
-```text
+```
 v1/DNSRecord
 v1/Certificate
 ```
 
 ---
 
-## 9.3 Watchers
+## Watchers
 
-```text
+```
 watchers
 ```
 
-contains clients that currently watch resources.
+contains clients with active watch connections. Watch connections are in memory and are lost when the API server stops.
 
 When a resource changes, the API server sends an event to matching watchers.
 
 ---
 
-# 10. Concurrency
+# Concurrency
 
 The API server can handle multiple HTTP requests at the same time.
 
 Go's HTTP server starts request handling concurrently.
 
-This means two requests can access the store at the same time.
-
-The store therefore uses:
+This means requests can run concurrently. The server mutex protects its in-memory watcher map, while the storage backend handles resource operations:
 
 ```go
-sync.RWMutex
+sync.Mutex
 ```
 
-The mutex protects the internal maps.
-
-Read operations use a read lock.
-
-Write operations use a write lock.
+The mutex protects watcher registration and removal. Resource CRUD uses the `ResourceStore` implementation.
 
 For example:
 
-```text
-GET resource
-    |
-    +-- read lock
+```
+watch registration/removal
+  |
+  +-- mutex
 
-POST resource
-    |
-    +-- write lock
+resource create/update/delete
+  |
+  +-- ResourceStore
 ```
 
-Do not remove the mutex when changing the store.
-
-Without synchronization, concurrent requests can corrupt the store or cause data races.
+Keep watcher-map access synchronized. The database implementation manages resource transaction safety.
 
 ---
 
-# 11. API Endpoint Summary
+# API Endpoint Summary
 
 The current API endpoints are:
 
@@ -663,11 +658,11 @@ The following sections describe each endpoint.
 
 ---
 
-# 12. List Resource Kinds
+# List Resource Kinds
 
 Endpoint:
 
-```text
+```
 GET /api/v1/kinds
 ```
 
@@ -704,32 +699,27 @@ Example response:
 
 The response contains:
 
-```text
+```
 apiVersion
 kind
-items
-```
 
-`items` contains the registered kinds.
-
----
-
-# 13. Register a Resource Kind
+# Register a Resource Kind
 
 Endpoint:
 
-```text
+```
 POST /api/v1/kinds
 ```
 
 The request body must contain:
 
-```text
+```
 apiVersion
 kind
 resource
-namespaced
 ```
+
+`namespaced` is optional and defaults to `false`. `schema` is optional; when present, it is a JSON Schema for `spec`.
 
 Example:
 
@@ -742,11 +732,20 @@ curl \
     "apiVersion": "v1",
     "kind": "DNSRecord",
     "resource": "dnsrecords",
-    "namespaced": true
+    "namespaced": true,
+    "schema": {
+      "type": "object",
+      "required": ["hostname", "address"],
+      "properties": {
+        "hostname": { "type": "string", "minLength": 1 },
+        "address": { "type": "string", "minLength": 1 }
+      },
+      "additionalProperties": false
+    }
   }'
 ```
 
-The server returns HTTP `201 Created`.
+The server checks that the schema is valid and returns HTTP `201 Created`.
 
 Example response:
 
@@ -755,23 +754,30 @@ Example response:
   "apiVersion": "v1",
   "kind": "DNSRecord",
   "resource": "dnsrecords",
-  "namespaced": true
+  "namespaced": true,
+  "schema": {
+    "type": "object",
+    "required": ["hostname", "address"],
+    "properties": {
+      "hostname": { "type": "string", "minLength": 1 },
+      "address": { "type": "string", "minLength": 1 }
+    },
+    "additionalProperties": false
+  }
 }
 ```
 
-The current implementation stores the registration in memory.
+The kind and schema are persisted with the selected storage backend. Controllers can still register their kinds at startup; registration updates the existing definition.
 
-If the API server restarts, the registration is lost.
-
-A controller therefore registers its kind when it starts.
+An invalid schema returns HTTP `400 Bad Request`. A schema-invalid resource create or update also returns `400`, and the API server does not store it or publish a watch event.
 
 ---
 
-# 14. List All Resources
+# List All Resources
 
 Endpoint:
 
-```text
+```
 GET /api/v1/resources
 ```
 
@@ -810,13 +816,13 @@ This endpoint is useful for administration and debugging.
 
 ---
 
-# 15. Filter Resources by Kind
+# Filter Resources by Kind
 
 Use the `kind` query argument.
 
 Endpoint:
 
-```text
+```
 GET /api/v1/resources?kind=DNSRecord
 ```
 
@@ -830,11 +836,11 @@ Only `DNSRecord` resources are returned.
 
 ---
 
-# 16. Filter Resources by API Version
+# Filter Resources by API Version
 
 Use:
 
-```text
+```
 apiVersion
 ```
 
@@ -852,11 +858,11 @@ This returns resources with:
 
 ---
 
-# 17. Filter Resources by Namespace
+# Filter Resources by Namespace
 
 Use:
 
-```text
+```
 namespace
 ```
 
@@ -870,7 +876,7 @@ This returns resources in the `default` namespace.
 
 ---
 
-# 18. Combine Resource Filters
+# Combine Resource Filters
 
 The filters can be combined.
 
@@ -883,7 +889,7 @@ curl \
 
 This requests:
 
-```text
+```
 apiVersion = v1
 kind       = DNSRecord
 namespace  = default
@@ -893,11 +899,11 @@ The filters are applied together.
 
 ---
 
-# 19. List Resources of a Specific Kind
+# List Resources of a Specific Kind
 
 Endpoint:
 
-```text
+```
 GET /api/v1/{kind}
 ```
 
@@ -940,7 +946,7 @@ Example:
 
 ---
 
-# 20. List a Kind in a Namespace
+# List a Kind in a Namespace
 
 The collection endpoint accepts the `namespace` query argument.
 
@@ -955,11 +961,11 @@ This returns only `DNSRecord` resources in the `default` namespace.
 
 ---
 
-# 21. Create a Resource
+# Create a Resource
 
 Endpoint:
 
-```text
+```
 POST /api/v1/{kind}
 ```
 
@@ -984,11 +990,11 @@ curl \
   }'
 ```
 
-The API server creates the resource.
+The API server validates `spec` against the registered `DNSRecord` schema and creates the resource only when it is valid.
 
 The server generates:
 
-```text
+```
 UID
 Generation
 ResourceVersion
@@ -996,21 +1002,23 @@ ResourceVersion
 
 The first generation is:
 
-```text
+```
 1
 ```
 
 The server returns HTTP:
 
-```text
+```
 201 Created
 ```
 
 The created resource is returned in the response.
 
+If `spec` does not match the registered schema, the API server returns HTTP `400 Bad Request`. The resource is not stored and no watch event is sent.
+
 ---
 
-# 22. Create a Certificate
+# Create a Certificate
 
 Example:
 
@@ -1037,11 +1045,11 @@ The certificate controller can then observe the new resource.
 
 ---
 
-# 23. Read One Resource
+# Read One Resource
 
 Endpoint:
 
-```text
+```
 GET /api/v1/{kind}/{name}
 ```
 
@@ -1080,11 +1088,11 @@ curl \
 
 ---
 
-# 24. Update a Resource
+# Update a Resource
 
 Endpoint:
 
-```text
+```
 PUT /api/v1/{kind}/{name}
 ```
 
@@ -1109,13 +1117,15 @@ curl \
   }'
 ```
 
-If the resource exists, the server updates it.
+If the resource exists and `spec` matches the registered schema, the server updates it.
+
+If validation fails, the server returns HTTP `400 Bad Request`. It leaves the stored resource unchanged and sends no watch event.
 
 If the `spec` changes, the generation increases.
 
 For example:
 
-```text
+```
 generation 1
        |
        | spec changed
@@ -1129,11 +1139,11 @@ The API server sends a `MODIFIED` watch event.
 
 ---
 
-# 25. Delete a Resource
+# Delete a Resource
 
 Endpoint:
 
-```text
+```
 DELETE /api/v1/{kind}/{name}
 ```
 
@@ -1163,7 +1173,7 @@ A controller must use the delete event to remove the corresponding external stat
 
 For example:
 
-```text
+```
 DNSRecord deleted
        |
        v
@@ -1175,11 +1185,11 @@ DNS record removed from DNS server
 
 ---
 
-# 26. Watch Resources
+# Watch Resources
 
 The watch API is:
 
-```text
+```
 GET /api/v1/watch
 ```
 
@@ -1199,7 +1209,7 @@ Without `-N`, events may not appear immediately.
 
 ---
 
-# 27. Watch a Specific Kind
+# Watch a Specific Kind
 
 Example:
 
@@ -1210,7 +1220,7 @@ curl -N \
 
 This watches only:
 
-```text
+```
 DNSRecord
 ```
 
@@ -1218,7 +1228,7 @@ resources.
 
 ---
 
-# 28. Watch by API Version
+# Watch by API Version
 
 Example:
 
@@ -1231,7 +1241,7 @@ This watches resources with API version `v1`.
 
 ---
 
-# 29. Watch by Namespace
+# Watch by Namespace
 
 Example:
 
@@ -1244,7 +1254,7 @@ This watches resources in the `default` namespace.
 
 ---
 
-# 30. Combine Watch Filters
+# Combine Watch Filters
 
 Example:
 
@@ -1255,7 +1265,7 @@ curl -N \
 
 This watches:
 
-```text
+```
 apiVersion = v1
 kind       = DNSRecord
 namespace  = default
@@ -1263,7 +1273,7 @@ namespace  = default
 
 ---
 
-# 31. Watch Events
+# Watch Events
 
 The watch API uses newline-delimited JSON.
 
@@ -1300,7 +1310,7 @@ type WatchEvent struct {
 
 The event types are:
 
-```text
+```
 ADDED
 MODIFIED
 DELETED
@@ -1308,13 +1318,13 @@ DELETED
 
 ---
 
-# 32. Initial Watch State
+# Initial Watch State
 
 When a controller starts watching, the API server sends the current matching resources as `ADDED` events.
 
 For example, assume the API server already contains:
 
-```text
+```
 DNSRecord/example
 DNSRecord/test
 ```
@@ -1323,7 +1333,7 @@ A new DNS controller starts.
 
 The watch sends:
 
-```text
+```
 ADDED DNSRecord/example
 ADDED DNSRecord/test
 ```
@@ -1334,7 +1344,7 @@ After that, the connection remains open.
 
 If a new resource is created:
 
-```text
+```
 ADDED DNSRecord/new
 ```
 
@@ -1342,7 +1352,7 @@ is sent.
 
 If an existing resource changes:
 
-```text
+```
 MODIFIED DNSRecord/example
 ```
 
@@ -1350,7 +1360,7 @@ is sent.
 
 If a resource is deleted:
 
-```text
+```
 DELETED DNSRecord/test
 ```
 
@@ -1360,13 +1370,13 @@ This initial state is important for controller recovery.
 
 ---
 
-# 33. Controller Architecture
+# Controller Architecture
 
 A controller is a separate Go program.
 
 Its job is simple:
 
-```text
+```
 Watch resources
       |
       v
@@ -1383,7 +1393,7 @@ The controller must not depend on another controller being alive.
 
 For example:
 
-```text
+```
 DNS controller
     |
     +-- API server
@@ -1399,7 +1409,7 @@ If controllers need to exchange information, they should use resources.
 
 ---
 
-# 34. The Reconciliation Model
+# The Reconciliation Model
 
 A controller should be level-triggered.
 
@@ -1409,7 +1419,7 @@ Instead, it should inspect the current desired state and make the external syste
 
 For example:
 
-```text
+```
 Desired:
 
 example.test -> 192.168.1.10
@@ -1419,7 +1429,7 @@ The DNS controller checks the DNS system.
 
 If the DNS system already contains:
 
-```text
+```
 example.test -> 192.168.1.10
 ```
 
@@ -1427,7 +1437,7 @@ nothing needs to be done.
 
 If it contains:
 
-```text
+```
 example.test -> 192.168.1.20
 ```
 
@@ -1439,13 +1449,13 @@ This makes reconciliation idempotent.
 
 ---
 
-# 35. Idempotence
+# Idempotence
 
 A reconciliation function should be safe to run more than once.
 
 For example:
 
-```text
+```
 reconcile DNSRecord/example
 reconcile DNSRecord/example
 reconcile DNSRecord/example
@@ -1455,7 +1465,7 @@ should produce the same final state as running it once.
 
 Do not write controllers that assume:
 
-```text
+```
 one event = one required action
 ```
 
@@ -1469,7 +1479,7 @@ A controller must be able to reconcile the same resource again.
 
 ---
 
-# 36. Controller Restart
+# Controller Restart
 
 A controller can terminate at any time.
 
@@ -1477,7 +1487,7 @@ The API server continues to store resources.
 
 For example:
 
-```text
+```
 API server
     |
     +-- DNSRecord/example
@@ -1502,7 +1512,7 @@ It only needs to know the current desired state.
 
 ---
 
-# 37. Watch Reconnection
+# Watch Reconnection
 
 The current controllers use a simple reconnect loop.
 
@@ -1519,7 +1529,7 @@ for {
 
 If the API server connection closes:
 
-```text
+```
 watch connection closes
         |
         v
@@ -1538,7 +1548,7 @@ This is another reason why reconciliation must be idempotent.
 
 ---
 
-# 38. DNS Controller
+# DNS Controller
 
 The DNS controller registers:
 
@@ -1553,7 +1563,7 @@ The DNS controller registers:
 
 It watches:
 
-```text
+```
 /api/v1/watch?apiVersion=v1&kind=DNSRecord
 ```
 
@@ -1587,7 +1597,7 @@ A real controller can use this function to update a DNS server.
 
 ---
 
-# 39. Certificate Controller
+# Certificate Controller
 
 The certificate controller uses the same architecture.
 
@@ -1604,13 +1614,13 @@ It registers:
 
 It watches:
 
-```text
+```
 /api/v1/watch?apiVersion=v1&kind=Certificate
 ```
 
 It receives:
 
-```text
+```
 ADDED
 MODIFIED
 DELETED
@@ -1624,7 +1634,7 @@ For `DELETED`, it can remove or revoke the corresponding external state, dependi
 
 ---
 
-# 40. How to Create a New Controller
+# How to Create a New Controller
 
 You can create a new controller without changing the API server.
 
@@ -1632,26 +1642,26 @@ For example, assume you want a controller that manages DHCP reservations.
 
 Create:
 
-```text
+```
 dhcp-controller/
 └── main.go
 ```
 
 Choose a resource kind:
 
-```text
+```
 DHCPReservation
 ```
 
 Choose its resource name:
 
-```text
+```
 dhcReservations
 ```
 
 A clearer resource name would normally be:
 
-```text
+```
 dhcpreservations
 ```
 
@@ -1670,7 +1680,7 @@ The API server does not need any DHCP-specific code.
 
 ---
 
-# 41. Define the Resource
+# Define the Resource
 
 Decide what the desired state should contain.
 
@@ -1694,74 +1704,49 @@ For example:
 
 The controller owns the meaning of:
 
-```text
+```
 macAddress
 address
 hostname
 ```
 
-The API server only stores the JSON.
+The API server validates `spec` against the schema registered for this kind, then stores the resource.
 
 ---
 
-# 42. Register the New Kind
+# Register the New Kind
 
 The controller should register the kind when it starts.
 
-The Go structure is:
+The Go structure includes the schema for `spec`:
 
 ```go
 var dhcpReservationKind = protocol.ResourceKind{
-    APIVersion: "v1",
-    Kind:       "DHCPReservation",
-    Resource:   "dhcpreservations",
-    Namespaced: true,
+  APIVersion: "v1",
+  Kind:       "DHCPReservation",
+  Resource:   "dhcpreservations",
+  Namespaced: true,
+  Schema: map[string]any{
+    "type":     "object",
+    "required": []string{"macAddress", "address", "hostname"},
+    "properties": map[string]any{
+      "macAddress": map[string]any{"type": "string", "minLength": 1},
+      "address":    map[string]any{"type": "string", "minLength": 1},
+      "hostname":   map[string]any{"type": "string", "minLength": 1},
+    },
+    "additionalProperties": false,
+  },
 }
 ```
 
 Send it to:
 
-```text
+```
 POST /api/v1/kinds
 ```
 
-Example code:
-
-```go
-func registerKind() error {
-    body, err := json.Marshal(dhcpReservationKind)
-    if err != nil {
-        return err
-    }
-
-    response, err := http.Post(
-        apiServerURL+"/api/v1/kinds",
-        "application/json",
-        bytes.NewReader(body),
-    )
-    if err != nil {
-        return err
-    }
-
-    defer response.Body.Close()
-
-    if response.StatusCode != http.StatusCreated {
-        responseBody, _ := io.ReadAll(response.Body)
-
-        return fmt.Errorf(
-            "kind registration returned HTTP %d: %s",
-            response.StatusCode,
-            string(responseBody),
-        )
-    }
-
-    return nil
-}
-```
-
----
-
-# 43. Watch the New Resource
+The controller registration code can then marshal and POST `dhcpReservationKind` as shown in the preceding controller examples.
+# Watch the New Resource
 
 Build the watch URL:
 
@@ -1798,7 +1783,7 @@ if response.StatusCode != http.StatusOK {
 
 ---
 
-# 44. Read Watch Events
+# Read Watch Events
 
 Watch events are newline-delimited JSON.
 
@@ -1831,7 +1816,7 @@ protocol.WatchEvent
 
 ---
 
-# 45. Implement Reconciliation
+# Implement Reconciliation
 
 Start with:
 
@@ -1894,7 +1879,7 @@ A real controller should validate the values before using them.
 
 ---
 
-# 46. Handle Deletion
+# Handle Deletion
 
 Deletion is different from normal reconciliation.
 
@@ -1930,7 +1915,7 @@ If you ignore them, external resources can remain after the Controlplane resourc
 
 ---
 
-# 47. Add the Controller to the Taskfile
+# Add the Controller to the Taskfile
 
 Add a build task:
 
@@ -1964,7 +1949,7 @@ build:
 
 ---
 
-# 48. The Default Task
+# The Default Task
 
 The default Taskfile task lists available tasks.
 
@@ -1986,7 +1971,7 @@ This makes the project easier for new users.
 
 ---
 
-# 49. Building the Project
+# Building the Project
 
 Build everything:
 
@@ -1996,22 +1981,12 @@ task build
 
 The binaries are written to:
 
-```text
-bin/
-```
-
-For example:
-
-```text
-bin/
-├── api-server
-├── dns-controller
-└── certificate-controller
+The kind registry stores each kind's API version, resource name, namespaced flag, and optional `spec` schema.
 ```
 
 After adding a DHCP controller:
 
-```text
+```
 bin/
 ├── api-server
 ├── dns-controller
@@ -2021,7 +1996,7 @@ bin/
 
 ---
 
-# 50. Running the API Server
+# Running the API Server
 
 Run:
 
@@ -2031,7 +2006,7 @@ task run
 
 The API server listens on:
 
-```text
+```
 localhost:8080
 ```
 
@@ -2045,7 +2020,7 @@ curl http://localhost:8080/
 
 returns:
 
-```text
+```
 404 page not found
 ```
 
@@ -2059,7 +2034,7 @@ curl http://localhost:8080/api/v1/kinds
 
 ---
 
-# 51. Running a Controller
+# Running a Controller
 
 Run the DNS controller:
 
@@ -2079,7 +2054,7 @@ It then starts its watch.
 
 A normal controller log looks similar to:
 
-```text
+```
 DNS controller started
 registered resource kind v1/DNSRecord
 watch connected
@@ -2087,7 +2062,7 @@ watch connected
 
 ---
 
-# 52. Test the API Manually
+# Test the API Manually
 
 Start the API server.
 
@@ -2171,7 +2146,7 @@ curl \
 
 ---
 
-# 53. HTTP Status Codes
+# HTTP Status Codes
 
 The current API uses normal HTTP status codes.
 
@@ -2179,7 +2154,7 @@ The current API uses normal HTTP status codes.
 | ------ | ------------------------------ |
 | 200    | Request completed successfully |
 | 201    | Resource or kind created       |
-| 400    | Invalid request                |
+| 400    | Invalid request, schema, or resource spec |
 | 404    | Resource or endpoint not found |
 | 405    | HTTP method is not supported   |
 | 409    | Resource already exists        |
@@ -2187,17 +2162,17 @@ The current API uses normal HTTP status codes.
 
 For example, creating a resource with a name that already exists returns:
 
-```text
+```
 409 Conflict
 ```
 
 ---
 
-# 54. API Request Flow
+# API Request Flow
 
 A normal resource creation follows this flow:
 
-```text
+```
 curl
  |
  | POST /api/v1/DNSRecord
@@ -2229,7 +2204,7 @@ HTTP response
 
 At the same time, a DNS controller watching the resource receives:
 
-```text
+```
 ADDED
 ```
 
@@ -2237,11 +2212,11 @@ and starts reconciliation.
 
 ---
 
-# 55. API Update Flow
+# API Update Flow
 
 An update follows this flow:
 
-```text
+```
 PUT /api/v1/DNSRecord/example
           |
           v
@@ -2270,11 +2245,11 @@ It then reconciles the new desired state.
 
 ---
 
-# 56. API Delete Flow
+# API Delete Flow
 
 A delete follows this flow:
 
-```text
+```
 DELETE
   |
   v
@@ -2299,7 +2274,7 @@ It can then remove external state.
 
 ---
 
-# 57. API Server Does Not Run Controllers
+# API Server Does Not Run Controllers
 
 The API server does not contain code such as:
 
@@ -2321,7 +2296,7 @@ This allows a new controller to be added without changing the API server.
 
 For example:
 
-```text
+```
 API server
     |
     +-- DNS controller
@@ -2339,7 +2314,7 @@ Each controller can be developed and deployed separately.
 
 ---
 
-# 58. Controllers Communicate Through Resources
+# Controllers Communicate Through Resources
 
 Suppose a certificate controller creates a resource that another controller needs.
 
@@ -2347,7 +2322,7 @@ The controllers should not call each other directly.
 
 Instead:
 
-```text
+```
 Certificate Controller
         |
         v
@@ -2363,11 +2338,11 @@ It also means that one controller can be replaced without changing another contr
 
 ---
 
-# 59. Example Controller Design
+# Example Controller Design
 
 A controller normally has these components:
 
-```text
+```
 main
  |
  +-- register kind
@@ -2385,7 +2360,7 @@ main
 
 A larger controller can separate these into multiple Go files:
 
-```text
+```
 dns-controller/
 ├── main.go
 ├── controller.go
@@ -2400,35 +2375,15 @@ Split the code when it becomes difficult to understand.
 
 ---
 
-# 60. Validate Resource Data
+# Resource Validation
 
-The API server currently stores `spec` as generic JSON.
+The API server validates `spec` against the JSON Schema registered for the resource kind. The schema can check required fields, JSON types, allowed values, and other structural constraints. A schema-invalid create or update returns HTTP `400 Bad Request` without changing stored state or sending a watch event.
 
-This means the API server does not know that:
+The schema does not replace controller validation. A controller must still check domain-specific rules and constraints that depend on the target system. For example, a schema can require an address string, while the DNS controller checks whether that string is a valid address for its provider.
 
-```json
-"address": "192.168.1.10"
+Do not assume that data accepted by a schema is valid for every external system. A controller should validate:
+
 ```
-
-must be an IP address.
-
-The controller must validate its own resource data.
-
-For example:
-
-```go
-hostname, ok := resource.Spec["hostname"].(string)
-
-if !ok || hostname == "" {
-    return fmt.Errorf("hostname is required")
-}
-```
-
-Do not assume that user input is valid.
-
-A controller should validate:
-
-```text
 required fields
 data types
 allowed values
@@ -2439,7 +2394,7 @@ external constraints
 
 ---
 
-# 61. Controller Error Handling
+# Controller Error Handling
 
 A reconciliation error should normally not terminate the controller.
 
@@ -2459,7 +2414,7 @@ A production controller should normally add retry and backoff behavior.
 
 For example:
 
-```text
+```
 reconcile
    |
    +-- error
@@ -2477,13 +2432,13 @@ It does not yet implement a complete reconciliation retry queue.
 
 ---
 
-# 62. Logging
+# Logging
 
 Controllers should log enough information to identify a resource.
 
 A useful log entry includes:
 
-```text
+```
 kind
 name
 namespace
@@ -2493,7 +2448,7 @@ resourceVersion
 
 For example:
 
-```text
+```
 RECONCILE DNSRecord/example generation=2 resourceVersion=7
 ```
 
@@ -2503,7 +2458,7 @@ Avoid logging sensitive information.
 
 ---
 
-# 63. Resource Version and Generation
+# Resource Version and Generation
 
 These two fields have different purposes.
 
@@ -2511,7 +2466,7 @@ These two fields have different purposes.
 
 Example:
 
-```text
+```
 generation 1
 generation 2
 generation 3
@@ -2525,7 +2480,7 @@ It can change when the resource is updated.
 
 The distinction is:
 
-```text
+```
 generation
     |
     +-- desired configuration changed
@@ -2539,57 +2494,19 @@ A controller can use `generation` when it wants to know whether it has processed
 
 ---
 
-# 64. Current Storage Limitations
+# Current Storage Limitations
 
-The current API server stores all data in memory.
-
-For example:
-
-```text
-API server starts
-     |
-     v
-empty store
-```
-
-You create:
-
-```text
-DNSRecord/example
-```
-
-The resource exists.
-
-If the API server stops:
-
-```text
-API server stops
-     |
-     v
-memory is lost
-```
-
-When it starts again:
-
-```text
-empty store
-```
-
-This is suitable for development and for understanding the architecture.
-
-It is not suitable for a system that must retain state across API server restarts.
-
-A future implementation can use SQLite or another durable store.
+The API server persists resources and resource-kind registrations, including schemas, in SQLite or PostgreSQL. SQLite is the default. Active watch connections and historical watch events are not persisted. After a restart, controllers must reconnect and reconcile from the current resource snapshot; intermediate events are not replayed.
 
 ---
 
-# 65. Current Watch Limitations
+# Current Watch Limitations
 
 The current watch implementation is intentionally simple.
 
 A watch connection receives:
 
-```text
+```
 current resources
 +
 future changes
@@ -2599,7 +2516,7 @@ It does not provide a historical event log.
 
 For example, if a controller is offline while these events occur:
 
-```text
+```
 CREATE A
 UPDATE A
 DELETE A
@@ -2615,75 +2532,28 @@ However, if a future application requires guaranteed event history, the API serv
 
 ---
 
-# 66. Current API Server Persistence Model
+# Current API Server Persistence Model
 
 The current architecture is:
 
-```text
+```
 HTTP
  |
  v
 API server
  |
  v
-in-memory store
+ResourceStore
  |
- +-- resources
- +-- kinds
- +-- watchers
+ +-- SQLite or PostgreSQL: resources and kinds
+ +-- API-server memory: active watchers
 ```
 
-A future persistent architecture could be:
-
-```text
-HTTP
- |
- v
-API server
- |
- v
-persistent store
- |
- +-- resources
- +-- kinds
-```
-
-The controller API does not need to change significantly.
-
-This is one advantage of keeping persistence behind the API server.
+The controller API does not depend on which storage backend is selected.
 
 ---
 
-# 67. Security Considerations
-
-The current API server is intended for development.
-
-It does not provide production-grade security features such as:
-
-```text
-TLS
-authentication
-authorization
-audit logging
-network access control
-```
-
-Do not expose the development API server directly to an untrusted network.
-
-A production implementation should define:
-
-```text
-Who can create resources?
-Who can update resources?
-Who can delete resources?
-Who can watch resources?
-Who can register resource kinds?
-```
-
-Authentication and authorization should be added before exposing the API to untrusted clients.
-
----
-## Persistent Storage
+# Persistent Storage
 
 The API server uses a persistent storage layer to keep resource state across API-server restarts.
 
@@ -2700,7 +2570,7 @@ The default storage backend is SQLite.
 
 The API server uses the following architecture:
 
-```text
+```
                          API Server
                              |
                              v
@@ -2722,7 +2592,7 @@ The storage implementation is responsible for persistent resource state.
 
 Controllers do not access the database directly. Controllers communicate only with the API server.
 
-```text
+```
 Controller
     |
     | HTTP
@@ -2756,7 +2626,7 @@ The storage layer does not need to understand the contents of `spec` or `status`
 
 For example, these resources can all be stored using the same mechanism:
 
-```text
+```
 DNSRecord
 Certificate
 TerraformStack
@@ -2764,15 +2634,13 @@ DHCPReservation
 PKIResource
 ```
 
-The API server treats their resource-specific data as opaque JSON.
-
-The controller that owns a resource kind is responsible for understanding the contents of its `spec` and `status`.
+The API server validates `spec` against the JSON Schema registered for its kind, then stores it as JSON. The storage layer does not interpret resource fields. The owning controller understands their meaning and manages `status`.
 
 ### Resource Identity
 
 A resource is uniquely identified by:
 
-```text
+```
 apiVersion
 kind
 namespace
@@ -2781,7 +2649,7 @@ name
 
 For example:
 
-```text
+```
 v1 / DNSRecord / default / example
 ```
 
@@ -2789,7 +2657,7 @@ This allows different resource kinds to use the same name without conflict.
 
 For example:
 
-```text
+```
 v1 / DNSRecord / default / example
 v1 / Certificate / default / example
 ```
@@ -2806,7 +2674,7 @@ Every resource receives a monotonically increasing `resourceVersion`.
 
 For example:
 
-```text
+```
 resourceVersion = 1
 resourceVersion = 2
 resourceVersion = 3
@@ -2831,7 +2699,7 @@ When the desired resource configuration changes, the generation is incremented.
 
 For example:
 
-```text
+```
 Create:
 generation = 1
 
@@ -2852,7 +2720,7 @@ Resource kinds are also persisted.
 
 Controllers register their resource kinds through:
 
-```text
+```
 POST /api/v1/kinds
 ```
 
@@ -2873,7 +2741,7 @@ This means that kind registration survives an API-server restart when persistent
 
 The list of registered kinds can be retrieved with:
 
-```text
+```
 GET /api/v1/kinds
 ```
 
@@ -2899,7 +2767,7 @@ go run ./api-server
 
 The API server creates:
 
-```text
+```
 controlplane.db
 ```
 
@@ -2953,7 +2821,7 @@ Both storage implementations maintain the same logical data model.
 
 The main resource table contains fields equivalent to:
 
-```text
+```
 resources
 ------------------------------------------------
 api_version
@@ -2975,18 +2843,21 @@ Labels and annotations are also stored as structured data.
 
 A separate table stores registered resource kinds:
 
-```text
+```
 resource_kinds
 ------------------------------------------------
 api_version
 kind
 resource
 namespaced
+schema
 ```
+
+The `schema` column contains the JSON Schema used to validate `spec`. Older database files receive an empty schema during migration, which leaves their existing kinds unrestricted until a controller registers an updated definition.
 
 A metadata table stores the current resource-version counter:
 
-```text
+```
 metadata
 ------------------------------------------------
 key
@@ -3023,7 +2894,7 @@ The same principle applies to other controllers.
 
 For example:
 
-```text
+```
 TerraformStack resource
         |
         v
@@ -3048,7 +2919,7 @@ Persistent storage also changes what happens when a controller stops.
 
 Suppose a user creates a resource while the controller is not running:
 
-```text
+```
 User
  |
  | POST DNSRecord
@@ -3063,7 +2934,7 @@ The resource is stored even though the DNS controller is offline.
 
 Later, the controller starts:
 
-```text
+```
 DNS Controller
       |
       | LIST / WATCH
@@ -3086,7 +2957,7 @@ The API server can also restart without losing resources.
 
 Before the restart:
 
-```text
+```
 Database
     |
     +-- DNSRecord/example
@@ -3100,7 +2971,7 @@ The database remains available.
 
 After the API server starts:
 
-```text
+```
 API Server
     |
     v
@@ -3121,7 +2992,7 @@ Resource state is persistent, but active watch connections are not.
 
 Watch connections exist only in API-server memory:
 
-```text
+```
 Database
     |
     +-- Persistent resources
@@ -3167,7 +3038,7 @@ This makes it possible to add another storage implementation later without chang
 
 For example:
 
-```text
+```
 ResourceStore
      |
      +-- SQLite
@@ -3217,7 +3088,7 @@ The database is the source of truth.
 
 A resource operation follows this general sequence:
 
-```text
+```
 Client
   |
   | POST / PUT / DELETE
@@ -3262,7 +3133,7 @@ These improvements do not require changing the resource model or controller API.
 
 The central design remains:
 
-```text
+```
                 Persistent Desired State
                          |
                          v
@@ -3283,18 +3154,46 @@ The database provides durable state. The API server provides the resource API. C
 
 ---
 
-# 68. Production Improvements
+# Security Considerations
+
+The current API server is intended for development.
+
+It does not provide production-grade security features such as:
+
+```
+TLS
+authentication
+authorization
+audit logging
+network access control
+```
+
+Do not expose the development API server directly to an untrusted network.
+
+A production implementation should define:
+
+```
+Who can create resources?
+Who can update resources?
+Who can delete resources?
+Who can watch resources?
+Who can register resource kinds?
+```
+
+Authentication and authorization should be added before exposing the API to untrusted clients.
+
+---
+
+# Production Improvements
 
 The current implementation is a small control-plane foundation.
 
 A production system can add:
 
-```text
+```
 authentication
 authorization
 TLS
-resource schemas
-resource validation
 optimistic concurrency
 durable watch history
 watch resource versions
@@ -3315,7 +3214,7 @@ Keep the generic core small.
 
 ---
 
-# 69. Testing Controllers
+# Testing Controllers
 
 A controller should be tested independently.
 
@@ -3327,7 +3226,7 @@ task test-controllers
 
 The test process can:
 
-```text
+```
 create resources
 update resources
 delete resources
@@ -3339,7 +3238,7 @@ A controller test should verify behavior rather than only verify that an HTTP re
 
 For example:
 
-```text
+```
 Create DNSRecord
        |
        v
@@ -3369,74 +3268,75 @@ DNS state removed
 
 ---
 
-# 70. Recommended Controller Development Process
+# Recommended Controller Development Process
 
 Use this sequence when creating a new controller.
 
-## Step 1: Define the resource
+## Define the resource
 
 Decide:
 
-```text
+```
 kind
 apiVersion
 spec
 status
+spec schema
 ```
 
 Keep the specification small.
 
-## Step 2: Register the kind
+## Register the kind
 
-Add:
+Register the kind and its JSON Schema for `spec` with:
 
-```text
+```
 POST /api/v1/kinds
 ```
 
 to the controller startup process.
 
-## Step 3: Create the watch
+## Create the watch
 
 Watch only the resource kinds that the controller needs.
 
-## Step 4: Implement reconciliation
+## Implement reconciliation
 
 Handle:
 
-```text
+```
 ADDED
 MODIFIED
 DELETED
 ```
 
-## Step 5: Make reconciliation idempotent
+## Make reconciliation idempotent
 
 Running reconciliation more than once must be safe.
 
-## Step 6: Validate the resource
+## Validate the resource
 
-Check all required fields.
+Validate domain-specific rules and external-system constraints that the schema cannot express.
 
-## Step 7: Handle external failures
+## Handle external failures
 
 Do not terminate the controller because an external system is temporarily unavailable.
 
-## Step 8: Add tests
+## Add tests
 
 Test create, update, delete, restart, and error conditions.
 
-## Step 9: Add logging
+## Add logging
 
 Include resource identity in log messages.
 
-## Step 10: Add the controller to the build
+## Add the controller to the build
 
 Update the Taskfile.
 
 ---
 
-# 71. Complete Controller Pattern
+# Complete Controller Pattern
 
 A small controller can follow this pattern:
 
@@ -3463,6 +3363,14 @@ var resourceKind = protocol.ResourceKind{
     Kind:       "ExampleResource",
     Resource:   "exampleresources",
     Namespaced: true,
+    Schema: map[string]any{
+      "type":     "object",
+      "required": []string{"name"},
+      "properties": map[string]any{
+        "name": map[string]any{"type": "string", "minLength": 1},
+      },
+      "additionalProperties": false,
+    },
 }
 
 func main() {
@@ -3604,9 +3512,9 @@ This pattern is enough to build a basic controller.
 
 ---
 
-# 72. Common Mistakes
+# Common Mistakes
 
-## Mistake 1: Put controller logic in the API server
+## Put controller logic in the API server
 
 Do not do this:
 
@@ -3620,7 +3528,7 @@ The API server must remain generic.
 
 ---
 
-## Mistake 2: Depend on event history
+## Depend on event history
 
 Do not assume that every event will always be delivered.
 
@@ -3628,7 +3536,7 @@ A controller must be able to reconstruct the desired state from the current reso
 
 ---
 
-## Mistake 3: Make reconciliation non-idempotent
+## Make reconciliation non-idempotent
 
 Avoid code that creates duplicate external objects every time it receives an event.
 
@@ -3638,13 +3546,13 @@ Then change it only when necessary.
 
 ---
 
-## Mistake 4: Ignore delete events
+## Ignore delete events
 
 If the controller creates external state, it normally must also remove that state when the resource is deleted.
 
 ---
 
-## Mistake 5: Stop the controller on one external error
+## Stop the controller on one external error
 
 External systems can fail temporarily.
 
@@ -3652,15 +3560,13 @@ A controller should normally retry.
 
 ---
 
-## Mistake 6: Assume `spec` is valid
+## Assume `spec` is valid
 
-The API server stores generic JSON.
-
-The controller must validate its own resource specification.
+The API server validates `spec` against the kind's registered schema. A controller must still check domain-specific rules and external-system constraints.
 
 ---
 
-## Mistake 7: Store controller state only in memory
+## Store controller state only in memory
 
 A controller may restart.
 
@@ -3670,11 +3576,11 @@ The API server resource should contain the desired state.
 
 ---
 
-# 73. Recommended Mental Model
+# Recommended Mental Model
 
 When developing a controller, think about the system this way:
 
-```text
+```
 Resource
    |
    | says what the user wants
@@ -3692,7 +3598,7 @@ External system
 
 The controller asks:
 
-```text
+```
 What should exist?
 ```
 
@@ -3700,7 +3606,7 @@ from the resource.
 
 Then it asks:
 
-```text
+```
 What exists now?
 ```
 
@@ -3708,7 +3614,7 @@ from the external system.
 
 Then it changes the external system until:
 
-```text
+```
 desired state == actual state
 ```
 
@@ -3716,19 +3622,19 @@ This is reconciliation.
 
 ---
 
-# 74. Complete API Reference
+# Complete API Reference
 
 The following is the complete API reference for the current implementation.
 
 ## Kind discovery
 
-```text
+```
 GET /api/v1/kinds
 ```
 
 Arguments:
 
-```text
+```
 none
 ```
 
@@ -3738,7 +3644,7 @@ Returns all registered resource kinds.
 
 ## Kind registration
 
-```text
+```
 POST /api/v1/kinds
 ```
 
@@ -3749,21 +3655,30 @@ Request body:
   "apiVersion": "v1",
   "kind": "ExampleResource",
   "resource": "exampleresources",
-  "namespaced": true
+  "namespaced": true,
+  "schema": {
+    "type": "object",
+    "required": ["name"],
+    "properties": {
+      "name": { "type": "string" }
+    }
+  }
 }
 ```
+
+`schema` is optional. When provided, it validates the resource's `spec` on create and update.
 
 ---
 
 ## All resources
 
-```text
+```
 GET /api/v1/resources
 ```
 
 Optional query arguments:
 
-```text
+```
 apiVersion
 kind
 namespace
@@ -3771,7 +3686,7 @@ namespace
 
 Example:
 
-```text
+```
 /api/v1/resources?apiVersion=v1&kind=DNSRecord&namespace=default
 ```
 
@@ -3779,13 +3694,13 @@ Example:
 
 ## All resources watch
 
-```text
+```
 GET /api/v1/watch
 ```
 
 Optional query arguments:
 
-```text
+```
 apiVersion
 kind
 namespace
@@ -3793,7 +3708,7 @@ namespace
 
 Example:
 
-```text
+```
 /api/v1/watch?apiVersion=v1&kind=DNSRecord&namespace=default
 ```
 
@@ -3801,19 +3716,19 @@ Example:
 
 ## Resource collection
 
-```text
+```
 GET /api/v1/{kind}
 ```
 
 Optional query argument:
 
-```text
+```
 namespace
 ```
 
 Example:
 
-```text
+```
 GET /api/v1/DNSRecord?namespace=default
 ```
 
@@ -3821,7 +3736,7 @@ GET /api/v1/DNSRecord?namespace=default
 
 ## Create resource
 
-```text
+```
 POST /api/v1/{kind}
 ```
 
@@ -3846,19 +3761,19 @@ Request body:
 
 ## Read resource
 
-```text
+```
 GET /api/v1/{kind}/{name}
 ```
 
 Optional query argument:
 
-```text
+```
 namespace
 ```
 
 Example:
 
-```text
+```
 GET /api/v1/DNSRecord/example?namespace=default
 ```
 
@@ -3866,7 +3781,7 @@ GET /api/v1/DNSRecord/example?namespace=default
 
 ## Update resource
 
-```text
+```
 PUT /api/v1/{kind}/{name}
 ```
 
@@ -3874,7 +3789,7 @@ Request body contains the complete resource.
 
 Example:
 
-```text
+```
 PUT /api/v1/DNSRecord/example
 ```
 
@@ -3882,29 +3797,29 @@ PUT /api/v1/DNSRecord/example
 
 ## Delete resource
 
-```text
+```
 DELETE /api/v1/{kind}/{name}
 ```
 
 Optional query argument:
 
-```text
+```
 namespace
 ```
 
 Example:
 
-```text
+```
 DELETE /api/v1/DNSRecord/example?namespace=default
 ```
 
 ---
 
-# 75. Final Architecture
+# Final Architecture
 
 The complete current architecture can be represented as:
 
-```text
+```
                          +----------------------+
                          |      API Server      |
                          |                      |
@@ -3925,7 +3840,7 @@ The complete current architecture can be represented as:
 
 The important dependency direction is:
 
-```text
+```
 protocol
    ^
    |
@@ -3946,13 +3861,13 @@ This allows the system to grow without turning the API server into a large colle
 
 ---
 
-# 76. Summary
+# Summary
 
 Controlplane is a generic resource-oriented control plane.
 
 The API server provides:
 
-```text
+```
 resource storage
 resource CRUD
 resource listing
@@ -3966,7 +3881,7 @@ Controllers provide the application-specific behavior.
 
 A controller:
 
-```text
+```
 registers a resource kind
 watches resources
 receives events
@@ -3978,7 +3893,7 @@ reconnects after failures
 
 The most important design rule is:
 
-```text
+```
 API server = generic state management
 
 Controller = domain-specific reconciliation
@@ -3988,7 +3903,7 @@ When you add a new infrastructure feature, prefer creating a new resource kind a
 
 For example:
 
-```text
+```
 DNSRecord
     -> DNS controller
 
@@ -4021,7 +3936,7 @@ Those features can be added later without changing the fundamental controller mo
 
 The core rule remains:
 
-```text
+```
 Resources describe desired state.
 
 The API server stores desired state.

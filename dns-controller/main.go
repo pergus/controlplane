@@ -22,6 +22,15 @@ var dnsRecordKind = protocol.ResourceKind{
 	Kind:       "DNSRecord",
 	Resource:   "dnsrecords",
 	Namespaced: true,
+	Schema: map[string]any{
+		"type":     "object",
+		"required": []string{"hostname", "address"},
+		"properties": map[string]any{
+			"hostname": map[string]any{"type": "string", "minLength": 1},
+			"address":  map[string]any{"type": "string", "minLength": 1},
+		},
+		"additionalProperties": false,
+	},
 }
 
 func main() {
@@ -113,14 +122,7 @@ func reconcile(event protocol.WatchEvent) error {
 }
 
 func reconcileDNSRecord(resource protocol.Resource) error {
-	log.Printf(
-		"RECONCILE DNSRecord/%s generation=%d resourceVersion=%d hostname=%v address=%v",
-		resource.Metadata.Name,
-		resource.Metadata.Generation,
-		resource.Metadata.ResourceVersion,
-		resource.Spec["hostname"],
-		resource.Spec["address"],
-	)
+	log.Printf("RECONCILE DNSRecord/%s generation=%d resourceVersion=%d hostname=%v address=%v", resource.Metadata.Name, resource.Metadata.Generation, resource.Metadata.ResourceVersion, resource.Spec["hostname"], resource.Spec["address"])
 
 	// The real DNS implementation would reconcile the desired
 	// DNS state against the actual DNS provider/server here.
@@ -131,12 +133,7 @@ func reconcileDNSRecord(resource protocol.Resource) error {
 }
 
 func removeDNSRecord(resource protocol.Resource) error {
-	log.Printf(
-		"DELETE DNSRecord/%s generation=%d resourceVersion=%d",
-		resource.Metadata.Name,
-		resource.Metadata.Generation,
-		resource.Metadata.ResourceVersion,
-	)
+	log.Printf("DELETE DNSRecord/%s generation=%d resourceVersion=%d", resource.Metadata.Name, resource.Metadata.Generation, resource.Metadata.ResourceVersion)
 
 	// Remove the DNS record from the external system here.
 	//

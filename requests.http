@@ -1,0 +1,39 @@
+POST http://localhost:8080/api/v1/DNSRecord 
+content-type: application/json
+
+{
+    "apiVersion": "v1",
+    "kind": "DNSRecord",
+    "metadata": {
+      "name": "server02",
+      "namespace": "default"
+    },
+    "spec": {
+      "hostname": "server02.domain.se",
+      "address": "192.168.1.11"
+    }
+}
+
+###
+
+
+GET http://localhost:8080/api/v1/resources
+
+###
+
+# Invalid request (missing hostname)
+
+POST http://localhost:8080/api/v1/DNSRecord 
+content-type: application/json
+
+{
+    "apiVersion": "v1",
+    "kind": "DNSRecord",
+    "metadata": {
+      "name": "server02",
+      "namespace": "default"
+    },
+    "spec": {
+      "address": "192.168.1.11"
+    }
+}
