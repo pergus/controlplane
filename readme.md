@@ -1,76 +1,40 @@
-# Controlplane User Guide
+# Controlplane
 
-## Introduction
-
-Controlplane is a small and generic control plane written in Go.
-
-The system provides a central API server. The API server stores resources and sends resource changes to controllers.
-
-A controller watches resources and makes changes to an external system.
-
-The design is similar to the controller model used by larger control-plane systems. The implementation is intentionally small. You can use it as a base for infrastructure projects.
-
-This guide explains:
-
-* how the API server works;
-* how resources are represented;
-* how to use the API;
-* all current API endpoints;
-* how resource watches work;
-* how controllers work;
-* how to create a new controller;
-* how controllers recover after a restart;
-* how to test a controller;
-* which parts of the current implementation are suitable for production and which parts need improvement.
-
-The guide uses simple language and short instructions. You do not need advanced Go knowledge to follow it.
+Controlplane is a resource-based control plane written in Go. The API server stores resources and kind definitions, validates resource specifications, and provides a REST API and an HTTP watch endpoint. It also publishes resource events to NATS JetStream. Controllers register kinds through JetStream and consume durable per-kind event streams to reconcile external systems. The `cpctl` command-line client manages resources and kinds through the REST API.
 
 ---
 
 # System Overview
 
-The system has three main parts:
+The system has four main parts: the API server, NATS JetStream, API clients, and controllers.
 
 ```
-                    +----------------------+
-                    |      API Server      |
-                    |                      |
-                    | Resource Store       |
-                    | Kind Registry        |
-                    | REST API             |
-                    | Watch API            |
-                    +----------+-----------+
-                               |
-                 +-------------+-------------+
-                 |                           |
-                 | HTTP API                  | HTTP Watch
-                 |                           |
-        +--------v--------+         +--------v--------+
-        | DNS Controller  |         | Certificate     |
-        |                 |         | Controller      |
-        +--------+--------+         +--------+--------+
-                 |                           |
-                 v                           v
-             DNS system                 PKI / ACME
+                      +----------------------+
+                      |      API Server      |
+                      |                      |
+                      | Resource Store       |
+                      | Kind Registry        |
+                      | REST API             |
+                      | Watch API            |
+                      +----------+-----------+
+                                 |
+                    +------------+------------+
+                    |                         |
+                    | REST API                | NATS JetStream
+                    |                         |
+           +--------v--------+       +--------v--------+
+           | API clients,    |       | DNS Controller  |
+           | cpctl, HTTP     |       | Certificate     |
+           +-----------------+       | Controller      |
+                                     +--------+--------+
+                                              |
+                                    +---------+---------+
+                                    |                   |
+                                    v                   v
+                                  DNS system         PKI / ACME
 ```
 
-The API server is the central component.
-
-Controllers are separate programs.
-
-The API server does not contain DNS logic.
-
-The API server does not contain certificate logic.
-
-The API server does not call controllers directly.
-
-Instead, the API server stores resources.
-
-A controller watches the resources that it understands.
-
-The controller then reconciles the desired state with the real state of the external system.
-
-This separation is one of the most important design rules in Controlplane.
+The API server stores desired state and remains independent of controller-specific logic. Controllers register the kinds they manage, consume their event streams, and reconcile external systems. They do not call one another directly.
 
 ---
 
@@ -86,12 +50,21 @@ controlplane/
 ├── protocol/
 │   └── resource.go
 │
+├── nats-server.conf
+│
+├── messaging/
+│   ├── client.go
+│   └── streams.go
+│
 ├── api-server/
 │   ├── main.go
 │   └── storage/
 │       ├── storage.go
 │       ├── sqlite.go
 │       └── postregs.go
+│
+├── cpctl/
+│   └── main.go
 │
 ├── dns-controller/
 │   └── main.go
@@ -100,35 +73,25 @@ controlplane/
     └── main.go
 ```
 
-Each directory has a specific purpose.
+`protocol` defines shared resource and event types, while `messaging` provides NATS JetStream operations. `api-server` serves the REST API and persists state. `cpctl` provides the command-line client, and each controller reconciles its resource kinds with an external system.
 
 ## `protocol`
 
-The `protocol` package contains the shared data structures.
-
-Controllers and the API server use these structures.
-
-For example:
+The `protocol` package contains the data structures shared by the API server and controllers. For example:
 
 ```go
 package protocol
 
 type Resource struct {
-    APIVersion string         `json:"apiVersion"`
-    Kind       string         `json:"kind"`
-    Metadata   Metadata       `json:"metadata"`
-    Spec       map[string]any `json:"spec,omitempty"`
-    Status     map[string]any `json:"status,omitempty"`
+  APIVersion string         `json:"apiVersion"`
+  Kind       string         `json:"kind"`
+  Metadata   Metadata       `json:"metadata"`
+  Spec       map[string]any `json:"spec,omitempty"`
+  Status     map[string]any `json:"status,omitempty"`
 }
 ```
 
-The protocol package must stay small.
-
-It must not contain DNS code.
-
-It must not contain certificate code.
-
-It must not contain controller logic.
+Keep the protocol package small and independent of DNS, certificates, and controller logic.
 
 The dependency direction is:
 
@@ -143,15 +106,13 @@ protocol
    +-- certificate-controller
 ```
 
-This makes the protocol reusable.
+This dependency direction lets the API server and controllers use the same protocol without depending on each other's implementation.
 
 ---
 
 # Resources
 
-A resource represents desired state.
-
-A resource has five main parts:
+A resource represents desired state. It has five main parts:
 
 ```
 apiVersion
@@ -180,7 +141,7 @@ Example:
 
 ## `apiVersion`
 
-`apiVersion` identifies the API version.
+`apiVersion` identifies the resource API version. Use it to evolve a resource definition.
 
 Example:
 
@@ -188,17 +149,13 @@ Example:
 "apiVersion": "v1"
 ```
 
-Use the version to allow the resource definition to evolve.
-
-Do not use the version to identify the controller.
-
-The controller identifies resources by their `kind`.
+Use `kind`, not `apiVersion`, to identify which controller manages a resource.
 
 ---
 
 ## `kind`
 
-`kind` identifies the type of resource.
+`kind` identifies the resource type and determines which controller manages it.
 
 Examples:
 
@@ -212,9 +169,7 @@ and:
 "kind": "Certificate"
 ```
 
-A controller normally watches one or more kinds.
-
-For example:
+A controller normally manages one or more kinds. For example:
 
 ```
 DNSRecord
@@ -230,7 +185,7 @@ Certificate
 
 ## `metadata`
 
-Metadata identifies a resource.
+Metadata identifies a resource by name and can also include its namespace, UID, generation, resource version, labels, and annotations.
 
 Example:
 
@@ -243,12 +198,7 @@ Example:
 
 The complete metadata structure is:
 
-```go
-type Metadata struct {
-    Name            string            `json:"name"`
-    Namespace       string            `json:"namespace,omitempty"`
-    UID             string            `json:"uid,omitempty"`
-    Generation      uint64            `json:"generation,omitempty"`
+The `resource_kinds` table stores registered kind definitions and their optional `spec` schemas. For example:
     ResourceVersion uint64            `json:"resourceVersion,omitempty"`
     Labels          map[string]string `json:"labels,omitempty"`
     Annotations     map[string]string `json:"annotations,omitempty"`
@@ -257,27 +207,21 @@ type Metadata struct {
 
 ### `name`
 
-The resource name.
-
-Example:
+The resource name identifies an object within its API version, kind, and namespace. For example:
 
 ```json
 "name": "example"
 ```
 
-The name identifies the resource together with its API version, kind, and namespace.
-
 ### `namespace`
 
-The namespace is optional.
-
-Example:
+The namespace is optional. For example:
 
 ```json
 "namespace": "default"
 ```
 
-A resource can therefore be identified by:
+A resource is identified by:
 
 ```
 apiVersion
@@ -288,11 +232,7 @@ name
 
 ### `uid`
 
-The API server creates the UID when a resource is created.
-
-A controller must not normally create the UID.
-
-Example:
+The API server creates a resource UID. A controller must not normally create it. For example:
 
 ```json
 "uid": "7f3f0a7e-..."
@@ -300,25 +240,15 @@ Example:
 
 ### `generation`
 
-The generation identifies changes to the desired resource configuration.
-
-The API server starts the generation at `1`.
-
-When the desired `spec` changes, the API server increments the generation.
-
-A controller can use the generation to determine which desired configuration it has processed.
+The generation identifies changes to the desired resource configuration. It starts at `1` and increases when `spec` changes. A controller can use it to determine which configuration it has processed.
 
 ### `resourceVersion`
 
-The resource version changes when the resource changes.
-
-It is managed by the API server and is useful for observing changes and for future concurrency control.
+The API server manages `resourceVersion` and changes it when a resource changes. Controllers can use it to observe stored changes. The API may use it for concurrency control in the future.
 
 ### `labels`
 
-Labels are key/value metadata.
-
-Example:
+Labels are key/value metadata. For example:
 
 ```json
 "labels": {
@@ -329,9 +259,7 @@ Example:
 
 ### `annotations`
 
-Annotations are also key/value metadata. They are intended for additional information.
-
-Example:
+Annotations are key/value metadata for additional information. For example:
 
 ```json
 "annotations": {
@@ -344,9 +272,7 @@ Example:
 
 # `spec`
 
-`spec` contains the desired state.
-
-The API server validates `spec` against the JSON Schema registered for its resource kind. It does not apply controller-specific meaning or reconcile the requested state.
+`spec` contains the desired state. The API server validates it against the JSON Schema registered for the resource kind, but it does not apply controller-specific meaning or reconcile the requested state.
 
 For example:
 
@@ -357,15 +283,7 @@ For example:
 }
 ```
 
-The API server checks that this data matches the kind's schema, then stores it.
-
-The DNS controller interprets its meaning and reconciles it.
-
-This is an important design rule.
-
-The API server is generic.
-
-A controller owns the meaning of its resource.
+The API server checks that the data matches the kind's schema, then stores it. The owning controller interprets the fields and reconciles the external system. This keeps the API server generic and gives each controller ownership of its resource's meaning.
 
 For a DNS controller:
 
@@ -374,7 +292,7 @@ spec.hostname
 spec.address
 ```
 
-may define a DNS record.
+define a DNS record.
 
 For a certificate controller:
 
@@ -383,9 +301,9 @@ spec.hostname
 spec.issuer
 ```
 
-may define a certificate request.
+define a certificate request.
 
-The API server knows each kind's schema, but does not need to know what valid values mean to the controller.
+The API server validates the schema but does not need to know what the values mean to a controller.
 
 ---
 
@@ -401,9 +319,7 @@ Example:
 }
 ```
 
-The current example controllers only log reconciliation activity. They do not yet update resource status.
-
-A future controller can use status to report information such as:
+The example controllers log reconciliation activity but do not update resource status. A controller can use `status` to report information such as:
 
 ```
 ready
@@ -448,12 +364,7 @@ The API server supports dynamic resource-kind registration.
 
 A resource kind is described by:
 
-```go
-type ResourceKind struct {
-    APIVersion string         `json:"apiVersion"`
-    Kind       string         `json:"kind"`
-    Resource   string         `json:"resource"`
-    Namespaced bool           `json:"namespaced"`
+The `watchers` map contains active HTTP watch connections. They exist only in API-server memory and close when the server stops. When a resource changes, the server sends the event to matching watchers and records it in the transactional outbox for JetStream delivery.
     Schema     map[string]any `json:"schema,omitempty"`
 }
 ```
@@ -504,9 +415,9 @@ Another example:
 }
 ```
 
-The controller registers its resource kind when it starts.
+The controller registers its resource kind through the JetStream registration stream when it starts. The API server creates a separate event stream for the registered kind.
 
-This means the API server does not need to contain a hard-coded list such as:
+The API server does not need a hard-coded list of resource kinds. For example, it does not need logic such as:
 
 ```go
 if kind == "DNSRecord" {
@@ -518,49 +429,29 @@ if kind == "Certificate" {
 }
 ```
 
-Do not add controller-specific logic to the API server.
-
-Instead, a new controller registers its own resource kind.
+Keep controller-specific logic in controllers. Each controller registers the resource kinds that it manages.
 
 ---
 
 # API Server
 
-The API server is the central process.
-
-The current server listens on:
+The API server is the central process. It listens on:
 
 ```
 http://localhost:8080
 ```
 
-The API server provides four main functions:
+The API server provides resource-kind discovery, resource CRUD, resource listing, and HTTP resource watching. CRUD means create, read, update, and delete.
 
-```
-1. Resource kind discovery
-2. Resource CRUD
-3. Resource listing
-4. Resource watching
-```
+The API server stores resources and kind registrations through `ResourceStore`. SQLite is the default backend, and PostgreSQL is also supported. Each resource change and its outbox event are written in one transaction, then the event is published to JetStream. The HTTP watch endpoint still sends a snapshot followed by live NDJSON events, but its active connections remain in API-server memory.
 
-CRUD means:
-
-```
-Create
-Read
-Update
-Delete
-```
-
-The API server stores resources and kind registrations through the `ResourceStore` interface. SQLite is the default backend, and PostgreSQL is also supported. Active watch connections remain in API-server memory and reconnect after a restart.
+Set `NATS_URL` to configure the broker. It defaults to `nats://localhost:4222`. Start NATS with JetStream before the API server or controllers. Controllers publish kind registrations to one stream. The API server validates and stores each kind, creates its event stream, then acknowledges the registration. Per-kind streams retain events for seven days, and durable consumers provide at-least-once delivery.
 
 ---
 
 # API Server Store
 
-The API server uses `ResourceStore` for persisted resources and kind registrations. Active watchers are kept in API-server memory.
-
-The API server keeps this storage interface and watcher registry:
+The API server uses `ResourceStore` for resources, kinds, and pending outbox events. The database persists those records; the `Server` structure keeps active HTTP watchers in memory:
 
 ```go
 type Server struct {
@@ -571,21 +462,15 @@ type Server struct {
 }
 ```
 
-The database stores resources and kinds. The `Server` structure holds active watcher connections.
-
 ## Resources
 
-Resources are stored by `apiVersion`, `kind`, `namespace`, and `name`, so different kinds and namespaces can reuse a name.
+Resources are stored by `apiVersion`, `kind`, `namespace`, and `name`. Different kinds or namespaces can therefore use the same name.
 
 ---
 
 ## Kinds
 
-```
-kinds
-```
-
-describes registered resource kinds and their optional `spec` schemas. These definitions are persisted by the storage backend.
+The `resource_kinds` table stores registered kind definitions and their optional `spec` schemas.
 
 For example:
 
@@ -598,29 +483,19 @@ v1/Certificate
 
 ## Watchers
 
-```
-watchers
-```
-
-contains clients with active watch connections. Watch connections are in memory and are lost when the API server stops.
-
-When a resource changes, the API server sends an event to matching watchers.
+The `watchers` map contains active HTTP watch connections. They exist only in API-server memory and close when the server stops. When a resource changes, the API server sends the event to matching watchers and records it in the outbox for JetStream delivery.
 
 ---
 
 # Concurrency
 
-The API server can handle multiple HTTP requests at the same time.
-
-Go's HTTP server starts request handling concurrently.
-
-This means requests can run concurrently. The server mutex protects its in-memory watcher map, while the storage backend handles resource operations:
+Go's HTTP server handles requests concurrently. The server mutex protects the in-memory watcher map, while the storage backend manages resource transactions:
 
 ```go
 sync.Mutex
 ```
 
-The mutex protects watcher registration and removal. Resource CRUD uses the `ResourceStore` implementation.
+The mutex protects watcher registration and removal. Resource CRUD uses `ResourceStore`.
 
 For example:
 
@@ -634,7 +509,7 @@ resource create/update/delete
   +-- ResourceStore
 ```
 
-Keep watcher-map access synchronized. The database implementation manages resource transaction safety.
+Keep watcher-map access synchronized. The storage implementation manages transaction safety for resource operations.
 
 ---
 
@@ -642,19 +517,19 @@ Keep watcher-map access synchronized. The database implementation manages resour
 
 The current API endpoints are:
 
-| Method | Endpoint                | Purpose               |
-| ------ | ----------------------- | --------------------- |
-| GET    | `/api/v1/kinds`         | List registered kinds |
-| POST   | `/api/v1/kinds`         | Register a kind       |
-| GET    | `/api/v1/resources`     | List resources        |
-| GET    | `/api/v1/watch`         | Watch resources       |
-| GET    | `/api/v1/{kind}`        | List a kind           |
-| POST   | `/api/v1/{kind}`        | Create a resource     |
-| GET    | `/api/v1/{kind}/{name}` | Get a resource        |
-| PUT    | `/api/v1/{kind}/{name}` | Update a resource     |
-| DELETE | `/api/v1/{kind}/{name}` | Delete a resource     |
+| Method        | Endpoint                                         | Purpose                       |
+| ------------- | ------------------------------------------------ | ----------------------------- |
+| GET           | `/api/v1/kinds`                                  | List registered kinds         |
+| POST          | `/api/v1/kinds`                                  | Register a kind               |
+| GET           | `/api/v1/kinds/{apiVersion}/{kind}`              | Get a kind                    |
+| PUT           | `/api/v1/kinds/{apiVersion}/{kind}`              | Update a kind                 |
+| DELETE        | `/api/v1/kinds/{apiVersion}/{kind}`              | Delete an unused kind         |
+| GET           | `/api/v1/resources`                              | List resources                |
+| GET           | `/api/v1/watch`                                  | Watch resources               |
+| GET, POST     | `/api/{apiVersion}/{kind}`                       | List or create resources      |
+| GET, PUT, DELETE | `/api/{apiVersion}/{kind}/{name}`              | Get, update, or delete resource |
 
-The following sections describe each endpoint.
+Run `cpctl api-resources` to list these endpoints along with registered kinds.
 
 ---
 
@@ -666,7 +541,7 @@ Endpoint:
 GET /api/v1/kinds
 ```
 
-This returns all registered resource kinds.
+This endpoint returns all registered resource kinds.
 
 Example:
 
@@ -697,11 +572,7 @@ Example response:
 }
 ```
 
-The response contains:
-
-```
-apiVersion
-kind
+The response has `apiVersion`, `kind`, and `items` fields. Each item contains one resource-kind definition.
 
 # Register a Resource Kind
 
@@ -711,7 +582,7 @@ Endpoint:
 POST /api/v1/kinds
 ```
 
-The request body must contain:
+The request body must contain these fields:
 
 ```
 apiVersion
@@ -719,7 +590,7 @@ kind
 resource
 ```
 
-`namespaced` is optional and defaults to `false`. `schema` is optional; when present, it is a JSON Schema for `spec`.
+`namespaced` is optional and defaults to `false`. `schema` is also optional; when present, it defines a JSON Schema for the resource's `spec`.
 
 Example:
 
@@ -745,7 +616,7 @@ curl \
   }'
 ```
 
-The server checks that the schema is valid and returns HTTP `201 Created`.
+The server validates the schema, stores the kind definition, and returns HTTP `201 Created` with the saved definition.
 
 Example response:
 
@@ -767,9 +638,7 @@ Example response:
 }
 ```
 
-The kind and schema are persisted with the selected storage backend. Controllers can still register their kinds at startup; registration updates the existing definition.
-
-An invalid schema returns HTTP `400 Bad Request`. A schema-invalid resource create or update also returns `400`, and the API server does not store it or publish a watch event.
+The kind and schema are stored in the selected database. A controller can register its kind again at startup; registration updates the existing definition. An invalid schema returns HTTP `400 Bad Request`. A resource create or update that fails schema validation also returns `400` and does not change stored state or publish an event.
 
 ---
 
@@ -787,7 +656,7 @@ Example:
 curl http://localhost:8080/api/v1/resources
 ```
 
-The response is a list of resources.
+The response is a list of resources. Use this endpoint to inspect or debug stored state.
 
 Example:
 
@@ -812,13 +681,11 @@ Example:
 }
 ```
 
-This endpoint is useful for administration and debugging.
-
 ---
 
 # Filter Resources by Kind
 
-Use the `kind` query argument.
+Use the `kind` query argument to return only resources of the selected kind.
 
 Endpoint:
 
@@ -832,17 +699,11 @@ Example:
 curl 'http://localhost:8080/api/v1/resources?kind=DNSRecord'
 ```
 
-Only `DNSRecord` resources are returned.
-
 ---
 
 # Filter Resources by API Version
 
-Use:
-
-```
-apiVersion
-```
+Use the `apiVersion` query argument to return resources with the selected API version.
 
 Example:
 
@@ -850,7 +711,7 @@ Example:
 curl 'http://localhost:8080/api/v1/resources?apiVersion=v1'
 ```
 
-This returns resources with:
+For example, this request returns resources with:
 
 ```json
 "apiVersion": "v1"
@@ -860,11 +721,7 @@ This returns resources with:
 
 # Filter Resources by Namespace
 
-Use:
-
-```
-namespace
-```
+Use the `namespace` query argument to return resources in the selected namespace.
 
 Example:
 
@@ -872,13 +729,11 @@ Example:
 curl 'http://localhost:8080/api/v1/resources?namespace=default'
 ```
 
-This returns resources in the `default` namespace.
-
 ---
 
 # Combine Resource Filters
 
-The filters can be combined.
+You can combine the `apiVersion`, `kind`, and `namespace` filters. The server applies all filters to the same request.
 
 Example:
 
@@ -887,15 +742,13 @@ curl \
   'http://localhost:8080/api/v1/resources?apiVersion=v1&kind=DNSRecord&namespace=default'
 ```
 
-This requests:
+This request selects:
 
 ```
 apiVersion = v1
 kind       = DNSRecord
 namespace  = default
 ```
-
-The filters are applied together.
 
 ---
 
@@ -904,24 +757,16 @@ The filters are applied together.
 Endpoint:
 
 ```
-GET /api/v1/{kind}
+GET /api/{apiVersion}/{kind}
 ```
 
-For DNS records:
+Use the collection endpoint to list resources for a kind. For example, these requests list DNS records and certificates:
 
 ```bash
 curl http://localhost:8080/api/v1/DNSRecord
 ```
 
-For certificates:
-
-```bash
-curl http://localhost:8080/api/v1/Certificate
-```
-
-The response is a list.
-
-Example:
+The server returns a resource list. For example:
 
 ```json
 {
@@ -948,16 +793,12 @@ Example:
 
 # List a Kind in a Namespace
 
-The collection endpoint accepts the `namespace` query argument.
-
-Example:
+Add the `namespace` query argument to list resources in one namespace. For example:
 
 ```bash
 curl \
   'http://localhost:8080/api/v1/DNSRecord?namespace=default'
 ```
-
-This returns only `DNSRecord` resources in the `default` namespace.
 
 ---
 
@@ -966,7 +807,7 @@ This returns only `DNSRecord` resources in the `default` namespace.
 Endpoint:
 
 ```
-POST /api/v1/{kind}
+POST /api/{apiVersion}/{kind}
 ```
 
 Example:
@@ -990,9 +831,9 @@ curl \
   }'
 ```
 
-The API server validates `spec` against the registered `DNSRecord` schema and creates the resource only when it is valid.
+The API server validates `spec` against the registered `DNSRecord` schema. If validation succeeds, it creates the resource, assigns a UID, sets generation to `1`, assigns a resource version, and returns HTTP `201 Created` with the resource.
 
-The server generates:
+The server generates these fields:
 
 ```
 UID
@@ -1000,21 +841,7 @@ Generation
 ResourceVersion
 ```
 
-The first generation is:
-
-```
-1
-```
-
-The server returns HTTP:
-
-```
-201 Created
-```
-
-The created resource is returned in the response.
-
-If `spec` does not match the registered schema, the API server returns HTTP `400 Bad Request`. The resource is not stored and no watch event is sent.
+If `spec` does not match the registered schema, the API server returns HTTP `400 Bad Request`. It does not store the resource or publish an event.
 
 ---
 
@@ -1041,7 +868,7 @@ curl \
   }'
 ```
 
-The certificate controller can then observe the new resource.
+After a successful create, the API server publishes an event to the Certificate stream for the certificate controller.
 
 ---
 
@@ -1050,7 +877,7 @@ The certificate controller can then observe the new resource.
 Endpoint:
 
 ```
-GET /api/v1/{kind}/{name}
+GET /api/{apiVersion}/{kind}/{name}
 ```
 
 Example:
@@ -1079,7 +906,7 @@ Example response:
 }
 ```
 
-For a namespaced resource, you can specify the namespace:
+For a namespaced resource, add the `namespace` query argument:
 
 ```bash
 curl \
@@ -1093,7 +920,7 @@ curl \
 Endpoint:
 
 ```
-PUT /api/v1/{kind}/{name}
+PUT /api/{apiVersion}/{kind}/{name}
 ```
 
 Example:
@@ -1117,11 +944,7 @@ curl \
   }'
 ```
 
-If the resource exists and `spec` matches the registered schema, the server updates it.
-
-If validation fails, the server returns HTTP `400 Bad Request`. It leaves the stored resource unchanged and sends no watch event.
-
-If the `spec` changes, the generation increases.
+If the resource exists and `spec` passes schema validation, the server updates it. If validation fails, it returns HTTP `400 Bad Request`, leaves the resource unchanged, and publishes no event. A change to `spec` increments the generation.
 
 For example:
 
@@ -1133,9 +956,7 @@ generation 1
 generation 2
 ```
 
-The resource version also changes.
-
-The API server sends a `MODIFIED` watch event.
+The update also changes the resource version and publishes a `MODIFIED` event.
 
 ---
 
@@ -1144,7 +965,7 @@ The API server sends a `MODIFIED` watch event.
 Endpoint:
 
 ```
-DELETE /api/v1/{kind}/{name}
+DELETE /api/{apiVersion}/{kind}/{name}
 ```
 
 Example:
@@ -1155,7 +976,7 @@ curl \
   http://localhost:8080/api/v1/DNSRecord/example
 ```
 
-For a namespaced resource:
+For a namespaced resource, include the `namespace` query argument:
 
 ```bash
 curl \
@@ -1163,15 +984,7 @@ curl \
   'http://localhost:8080/api/v1/DNSRecord/example?namespace=default'
 ```
 
-If the resource exists, it is removed.
-
-The API server sends a `DELETED` watch event.
-
-This event is important.
-
-A controller must use the delete event to remove the corresponding external state.
-
-For example:
+If the resource exists, the server removes it and publishes a `DELETED` event. The controller uses that event to remove the corresponding external state. For example:
 
 ```
 DNSRecord deleted
@@ -1193,9 +1006,7 @@ The watch API is:
 GET /api/v1/watch
 ```
 
-A watch connection remains open.
-
-The API server sends events when resources change.
+The connection remains open and streams matching events when resources change.
 
 Example:
 
@@ -1203,9 +1014,7 @@ Example:
 curl -N http://localhost:8080/api/v1/watch
 ```
 
-The `-N` option tells curl not to buffer the response.
-
-Without `-N`, events may not appear immediately.
+The `-N` option prevents curl from buffering the response, so events appear as the server sends them.
 
 ---
 
@@ -1218,13 +1027,7 @@ curl -N \
   'http://localhost:8080/api/v1/watch?kind=DNSRecord'
 ```
 
-This watches only:
-
-```
-DNSRecord
-```
-
-resources.
+This request watches only `DNSRecord` resources.
 
 ---
 
@@ -1237,7 +1040,7 @@ curl -N \
   'http://localhost:8080/api/v1/watch?apiVersion=v1'
 ```
 
-This watches resources with API version `v1`.
+This request watches resources with API version `v1`.
 
 ---
 
@@ -1250,7 +1053,7 @@ curl -N \
   'http://localhost:8080/api/v1/watch?namespace=default'
 ```
 
-This watches resources in the `default` namespace.
+This request watches resources in the `default` namespace.
 
 ---
 
@@ -1263,7 +1066,7 @@ curl -N \
   'http://localhost:8080/api/v1/watch?apiVersion=v1&kind=DNSRecord&namespace=default'
 ```
 
-This watches:
+This request filters by:
 
 ```
 apiVersion = v1
@@ -1275,11 +1078,7 @@ namespace  = default
 
 # Watch Events
 
-The watch API uses newline-delimited JSON.
-
-This format is also called NDJSON.
-
-Each line is one JSON object.
+The HTTP watch API uses newline-delimited JSON (NDJSON). Each line contains one JSON event object.
 
 Example:
 
@@ -1287,13 +1086,13 @@ Example:
 {"type":"ADDED","object":{"apiVersion":"v1","kind":"DNSRecord","metadata":{"name":"example"},"spec":{"hostname":"example.test","address":"192.168.1.10"}}}
 ```
 
-A second event can appear on the next line:
+A later event appears on another line:
 
 ```json
 {"type":"MODIFIED","object":{"apiVersion":"v1","kind":"DNSRecord","metadata":{"name":"example"},"spec":{"hostname":"example.test","address":"192.168.1.20"}}}
 ```
 
-A delete event looks like:
+A delete event uses the same structure:
 
 ```json
 {"type":"DELETED","object":{"apiVersion":"v1","kind":"DNSRecord","metadata":{"name":"example"}}}
@@ -1316,11 +1115,26 @@ MODIFIED
 DELETED
 ```
 
+## JetStream Event Subjects
+
+Each kind publishes to `events.<kind-token>`. The token is lowercase; a trailing `Record` is omitted, so the built-in kinds use:
+
+| Kind | Stream | Subject |
+| --- | --- | --- |
+| `DNSRecord` | `EVENTS_DNS` | `events.dns` |
+| `Certificate` | `EVENTS_CERTIFICATE` | `events.certificate` |
+
+Subscribe to all kinds with the NATS wildcard `events.*`, or filter one kind with `events.dns` or `events.certificate`. Other characters in kind names are percent-encoded so each kind remains one subject token. API versions of the same kind share its stream and subject; event payloads retain `apiVersion` so consumers can distinguish versions.
+
+The per-kind streams are durable and retain messages for seven days. A normal NATS wildcard subscription receives live publications; clients needing replay or acknowledgments should create a durable JetStream consumer for each relevant kind stream.
+
+Streams created by earlier versions used hashed names. On upgrade, the API server reuses an existing stream for its subject so retained events are not lost; those legacy names remain until the stream is explicitly migrated or deleted. Seven-day retention expires messages, not the stream itself.
+
 ---
 
 # Initial Watch State
 
-When a controller starts watching, the API server sends the current matching resources as `ADDED` events.
+When an HTTP client opens `/api/v1/watch`, the API server sends matching resources as `ADDED` events and then streams new events as NDJSON. This snapshot behavior applies to HTTP clients. Controllers use durable JetStream consumers and do not receive an HTTP snapshot.
 
 For example, assume the API server already contains:
 
@@ -1329,18 +1143,14 @@ DNSRecord/example
 DNSRecord/test
 ```
 
-A new DNS controller starts.
-
-The watch sends:
+An HTTP client opens a DNSRecord watch. The server sends:
 
 ```
 ADDED DNSRecord/example
 ADDED DNSRecord/test
 ```
 
-The controller reconciles both resources.
-
-After that, the connection remains open.
+The connection remains open after the initial snapshot and carries new matching events.
 
 If a new resource is created:
 
@@ -1366,18 +1176,16 @@ DELETED DNSRecord/test
 
 is sent.
 
-This initial state is important for controller recovery.
+Controllers recover through their durable JetStream consumer position, not through this HTTP snapshot.
 
 ---
 
 # Controller Architecture
 
-A controller is a separate Go program.
-
-Its job is simple:
+A controller is a separate Go program. It registers its resource kind through the registration stream, then consumes events from the kind's durable JetStream stream. It reconciles each event with the external system that it manages.
 
 ```
-Watch resources
+Register kind and consume events
       |
       v
 Receive event
@@ -1389,9 +1197,7 @@ Reconcile desired state
 Change external system
 ```
 
-The controller must not depend on another controller being alive.
-
-For example:
+Controllers must not depend on one another being online. For example:
 
 ```
 DNS controller
@@ -1401,21 +1207,13 @@ DNS controller
     +-- DNS system
 ```
 
-The DNS controller does not call the certificate controller.
-
-The certificate controller does not call the DNS controller.
-
-If controllers need to exchange information, they should use resources.
+The DNS controller does not call the certificate controller, and the certificate controller does not call the DNS controller. If controllers need to exchange information, they should use resources.
 
 ---
 
 # The Reconciliation Model
 
-A controller should be level-triggered.
-
-This means the controller should not depend only on the exact event that caused a change.
-
-Instead, it should inspect the current desired state and make the external system match it.
+A controller should be level-triggered: it should inspect the current desired state and make the external system match it, rather than depend only on the event that caused a change.
 
 For example:
 
@@ -1425,7 +1223,7 @@ Desired:
 example.test -> 192.168.1.10
 ```
 
-The DNS controller checks the DNS system.
+The DNS controller checks the DNS system and compares it with the desired record.
 
 If the DNS system already contains:
 
@@ -1433,7 +1231,7 @@ If the DNS system already contains:
 example.test -> 192.168.1.10
 ```
 
-nothing needs to be done.
+the controller does not need to change it.
 
 If it contains:
 
@@ -1451,9 +1249,7 @@ This makes reconciliation idempotent.
 
 # Idempotence
 
-A reconciliation function should be safe to run more than once.
-
-For example:
+A reconciliation function must be safe to run more than once. For example:
 
 ```
 reconcile DNSRecord/example
@@ -1461,7 +1257,7 @@ reconcile DNSRecord/example
 reconcile DNSRecord/example
 ```
 
-should produce the same final state as running it once.
+these calls should produce the same final state as one call.
 
 Do not write controllers that assume:
 
@@ -1469,23 +1265,13 @@ Do not write controllers that assume:
 one event = one required action
 ```
 
-Events can be repeated.
-
-Controllers can restart.
-
-Connections can fail.
-
-A controller must be able to reconcile the same resource again.
+Events can be repeated, controllers can restart, and connections can fail. A controller must be able to reconcile the same resource again.
 
 ---
 
 # Controller Restart
 
-A controller can terminate at any time.
-
-The API server continues to store resources.
-
-For example:
+A controller can stop while the API server continues to store resources and publish events. Its durable JetStream consumer records acknowledged messages and resumes from its saved position when the controller restarts.
 
 ```
 API server
@@ -1494,63 +1280,19 @@ API server
     +-- DNSRecord/test
 ```
 
-The DNS controller stops.
-
-The resources remain in the API server.
-
-When the DNS controller starts again, it creates a new watch.
-
-The API server sends the current resources as `ADDED` events.
-
-The controller reconciles them.
-
-This allows the controller to recover without a special recovery protocol.
-
-The controller does not need to know what events occurred while it was offline.
-
-It only needs to know the current desired state.
+The controller acknowledges an event only after reconciliation succeeds. If it stops before acknowledging an event, JetStream can deliver that event again. Since delivery is at least once, reconciliation must be idempotent. The controller can also read the current resource state from the API server when it needs to reconcile the latest desired state.
 
 ---
 
-# Watch Reconnection
+# Event Retention
 
-The current controllers use a simple reconnect loop.
-
-Conceptually:
-
-```go
-for {
-    if err := watch(); err != nil {
-        log.Printf("watch failed: %v", err)
-        time.Sleep(2 * time.Second)
-    }
-}
-```
-
-If the API server connection closes:
-
-```
-watch connection closes
-        |
-        v
-watch() returns an error
-        |
-        v
-controller waits
-        |
-        v
-controller connects again
-```
-
-The new watch sends the current resources again.
-
-This is another reason why reconciliation must be idempotent.
+Per-kind streams retain messages for seven days. JetStream removes expired messages, so a controller that remains offline beyond the retention period can miss older events. The controller must use the API server's current resource state to restore external state after a long outage.
 
 ---
 
 # DNS Controller
 
-The DNS controller registers:
+The DNS controller registers this resource kind:
 
 ```json
 {
@@ -1561,15 +1303,9 @@ The DNS controller registers:
 }
 ```
 
-It watches:
+It consumes events from the durable JetStream stream for `v1/DNSRecord`. The controller does not call the API server for registration or event delivery.
 
-```
-/api/v1/watch?apiVersion=v1&kind=DNSRecord
-```
-
-When it receives an event, it calls its reconciliation logic.
-
-The current example contains:
+The controller passes each `WatchEvent` to its reconciliation function:
 
 ```go
 func reconcile(event protocol.WatchEvent) error {
@@ -1591,17 +1327,13 @@ func reconcile(event protocol.WatchEvent) error {
 }
 ```
 
-The actual DNS implementation is intentionally not included.
-
-A real controller can use this function to update a DNS server.
+The example logs reconciliation activity. A production controller can use the same event handling to update a DNS server.
 
 ---
 
 # Certificate Controller
 
-The certificate controller uses the same architecture.
-
-It registers:
+The certificate controller uses the same registration and event-consumer pattern. It registers:
 
 ```json
 {
@@ -1612,13 +1344,7 @@ It registers:
 }
 ```
 
-It watches:
-
-```
-/api/v1/watch?apiVersion=v1&kind=Certificate
-```
-
-It receives:
+It consumes events from the durable `v1/Certificate` stream:
 
 ```
 ADDED
@@ -1628,9 +1354,7 @@ DELETED
 
 events.
 
-For `ADDED` and `MODIFIED`, it reconciles the requested certificate.
-
-For `DELETED`, it can remove or revoke the corresponding external state, depending on the certificate system.
+For `ADDED` and `MODIFIED`, it reconciles the requested certificate. For `DELETED`, it removes or revokes the corresponding external state, as required by the certificate system.
 
 ---
 
@@ -1739,79 +1463,36 @@ var dhcpReservationKind = protocol.ResourceKind{
 }
 ```
 
-Send it to:
-
-```
-POST /api/v1/kinds
-```
-
-The controller registration code can then marshal and POST `dhcpReservationKind` as shown in the preceding controller examples.
-# Watch the New Resource
-
-Build the watch URL:
+Publish it to the kind registration stream and wait for the API server's acknowledgment:
 
 ```go
-const watchURL =
-    apiServerURL +
-    "/api/v1/watch?apiVersion=v1&kind=DHCPReservation"
-```
-
-Open the connection:
-
-```go
-response, err := http.Get(watchURL)
+broker, err := messaging.Connect(messaging.URLFromEnv(), "dhcp-controller")
 if err != nil {
-    return err
+  return err
 }
+defer broker.Close()
 
-defer response.Body.Close()
-```
-
-Check the response:
-
-```go
-if response.StatusCode != http.StatusOK {
-    body, _ := io.ReadAll(response.Body)
-
-    return fmt.Errorf(
-        "watch returned HTTP %d: %s",
-        response.StatusCode,
-        string(body),
-    )
+if err := broker.RegisterKind(ctx, dhcpReservationKind); err != nil {
+  return err
 }
 ```
+## Consume Events
 
----
-
-# Read Watch Events
-
-Watch events are newline-delimited JSON.
-
-The controller can use `bufio.Scanner`:
+Use a stable durable name for the logical controller. Replicas of that controller should use the same name to share work; other clients should use their own durable name to receive an independent copy.
 
 ```go
-scanner := bufio.NewScanner(response.Body)
-
-for scanner.Scan() {
-    var event protocol.WatchEvent
-
-    if err := json.Unmarshal(scanner.Bytes(), &event); err != nil {
-        log.Printf("invalid watch event: %v", err)
-        continue
-    }
-
-    if err := reconcile(event); err != nil {
-        log.Printf("reconcile failed: %v", err)
-    }
-}
-```
-
-The scanner reads one event at a time.
-
-The JSON decoder converts the event into:
-
-```go
-protocol.WatchEvent
+durable := messaging.StableDurableName(
+  "dhcp-controller",
+  dhcpReservationKind.APIVersion,
+  dhcpReservationKind.Kind,
+)
+return broker.RunKindEvents(
+  ctx,
+  dhcpReservationKind.APIVersion,
+  dhcpReservationKind.Kind,
+  durable,
+  reconcile,
+)
 ```
 
 ---
@@ -1953,56 +1634,48 @@ build:
 
 The default Taskfile task lists available tasks.
 
-Run:
-
 ```bash
 task
 ```
 
-This is equivalent to:
-
-```bash
-task --list
-```
-
-The output shows the available tasks.
-
-This makes the project easier for new users.
 
 ---
 
 # Building the Project
 
-Build everything:
+Build the API server, `cpctl`, and both controllers:
 
 ```bash
 task build
 ```
 
-The binaries are written to:
-
-The kind registry stores each kind's API version, resource name, namespaced flag, and optional `spec` schema.
-```
-
-After adding a DHCP controller:
+The binaries are written to `bin/`:
 
 ```
 bin/
 ├── api-server
+├── cpctl
 ├── dns-controller
 ├── certificate-controller
-└── dhcp-controller
 ```
 
 ---
 
 # Running the API Server
 
-Run:
+Run the API server and its local JetStream server together:
 
 ```bash
 task run
 ```
+
+The API server and controllers use `NATS_URL`, which defaults to `nats://localhost:4222`.
+
+JetStream messages are stored under `.nats/jetstream` and survive NATS server restarts. Keep this directory to preserve messages; deleting it removes the local JetStream data.
+
+The local config uses separate `admin` and application users. The application account is restricted to Controlplane registration, event, inbox, and JetStream API subjects. Local-only development defaults are used when credentials are unset; set `NATS_ADMIN_PASSWORD`, `NATS_APP_USERNAME`, and `NATS_APP_PASSWORD` before startup for non-local use. Standalone API/controller clients use `NATS_USERNAME` and `NATS_PASSWORD`; these must match the application account. Monitoring is available on `127.0.0.1:8222`.
+
+For a multi-terminal setup, start NATS separately with `task run-nats`, then start the API server and controllers in their own terminals. Do not run both NATS tasks at once.
 
 The API server listens on:
 
@@ -2034,6 +1707,73 @@ curl http://localhost:8080/api/v1/kinds
 
 ---
 
+# cpctl Client
+
+`cpctl` is the Controlplane command-line client. It follows familiar kubectl-style commands and reads resource and kind definitions from YAML.
+
+Build it with `task build-cpctl` to create `bin/cpctl`, or run a one-off command with `task run-cpctl -- get kinds`.
+
+List API endpoints and registered kinds:
+
+```bash
+cpctl api-resources
+cpctl get kinds
+```
+
+List resources, get one resource, or select a namespace:
+
+```bash
+cpctl get DNSRecord -n default
+cpctl get DNSRecord example -n default -o yaml
+```
+
+Describe a resource or a kind:
+
+```bash
+cpctl describe DNSRecord example -n default
+cpctl describe DNSRecord/example -n default
+cpctl describe kind DNSRecord
+```
+
+Create or apply a resource definition:
+
+```yaml
+apiVersion: v1
+kind: DNSRecord
+metadata:
+  name: example
+  namespace: default
+spec:
+  hostname: example.test
+  address: 192.0.2.10
+```
+
+```bash
+cpctl create -f dns-record.yaml
+cpctl apply -f dns-record.yaml
+```
+
+Kind definitions use the same YAML form as the API, including `resource`, `namespaced`, and optional `schema` fields. `apply` creates missing definitions and updates existing ones. `delete kind KIND` removes a kind only after its resources have been deleted.
+
+Delete resources by name or from a YAML file:
+
+```bash
+cpctl delete DNSRecord example -n default
+cpctl delete -f dns-record.yaml
+```
+
+Watch all events, a kind, or one resource. `--type` can be repeated or given a comma-separated list:
+
+```bash
+cpctl watch
+cpctl watch DNSRecord
+cpctl watch DNSRecord/example -n default --type ADDED,MODIFIED
+```
+
+Use `--server` or `CPCTL_SERVER` to select the API server. Output formats are `table`, `yaml`, and `json`; use `-o yaml` or `-o json`.
+
+---
+
 # Running a Controller
 
 Run the DNS controller:
@@ -2048,25 +1788,20 @@ Run the certificate controller:
 task run-certificate
 ```
 
-A controller first registers its resource kind.
-
-It then starts its watch.
+A controller connects to `NATS_URL`, registers its resource kind, waits for the API server's acknowledgment, then starts its durable consumer.
 
 A normal controller log looks similar to:
 
 ```
 DNS controller started
 registered resource kind v1/DNSRecord
-watch connected
 ```
 
 ---
 
 # Test the API Manually
 
-Start the API server.
-
-Then register a DNS kind:
+Start the API server with `task run`, then register a DNS kind if a controller has not already registered it:
 
 ```bash
 curl \
@@ -2075,16 +1810,6 @@ curl \
   http://localhost:8080/api/v1/kinds \
   -d '{
     "apiVersion": "v1",
-    "kind": "DNSRecord",
-    "resource": "dnsrecords",
-    "namespaced": true
-  }'
-```
-
-Check the registered kinds:
-
-```bash
-curl http://localhost:8080/api/v1/kinds
 ```
 
 Create a resource:
@@ -2107,6 +1832,15 @@ curl \
     }
   }'
 ```
+    ```bash
+    task run-nats
+    ```
+
+    Then run the API server in another terminal:
+
+    ```bash
+    task run
+    ```
 
 Read it:
 
@@ -2154,23 +1888,20 @@ The current API uses normal HTTP status codes.
 | ------ | ------------------------------ |
 | 200    | Request completed successfully |
 | 201    | Resource or kind created       |
+| 204    | Kind deleted                   |
 | 400    | Invalid request, schema, or resource spec |
 | 404    | Resource or endpoint not found |
 | 405    | HTTP method is not supported   |
 | 409    | Resource already exists        |
 | 500    | Internal server error          |
 
-For example, creating a resource with a name that already exists returns:
-
-```
-409 Conflict
-```
+Creating a resource with a name that already exists returns HTTP `409 Conflict`.
 
 ---
 
 # API Request Flow
 
-A normal resource creation follows this flow:
+A resource creation stores the resource and an `ADDED` outbox event in one transaction. The API server responds after the transaction commits; a background worker then publishes the event to JetStream.
 
 ```
 curl
@@ -2188,33 +1919,23 @@ JSON decoder
  v
 Store.Create()
  |
- +-- generate UID
++-- generate UID and resourceVersion
++-- store resource and outbox event
  |
- +-- set generation
+ +--> HTTP response
  |
- +-- assign resourceVersion
+ +--> HTTP watcher broadcast
  |
- +-- store resource
- |
- +-- notify watchers
- |
- v
-HTTP response
+ +--> Outbox relay --> JetStream --> durable controller consumer
 ```
 
-At the same time, a DNS controller watching the resource receives:
-
-```
-ADDED
-```
-
-and starts reconciliation.
+The controller receives `ADDED` after the outbox relay publishes the event. JetStream confirms the publish before the relay removes the outbox row.
 
 ---
 
 # API Update Flow
 
-An update follows this flow:
+An update stores the new resource state and a `MODIFIED` outbox event in one transaction. The API server increments `generation` when `spec` changes and increments `resourceVersion` for each update.
 
 ```
 PUT /api/v1/DNSRecord/example
@@ -2225,29 +1946,21 @@ PUT /api/v1/DNSRecord/example
           v
       Store.Update
           |
-          +-- preserve UID
-          |
-          +-- compare desired state
-          |
-          +-- increment generation if spec changed
-          |
-          +-- increment resourceVersion
-          |
-          +-- send MODIFIED
-          |
-          v
-       HTTP 200
+           +-- preserve UID
+           +-- update generation and resourceVersion
+           +-- save resource and outbox event
+           |
+           +--> HTTP 200
+           +--> Outbox relay --> JetStream --> durable controller consumer
 ```
 
-The controller receives the `MODIFIED` event.
-
-It then reconciles the new desired state.
+After publication, the controller receives `MODIFIED` and reconciles the new desired state.
 
 ---
 
 # API Delete Flow
 
-A delete follows this flow:
+A delete removes the resource and stores a `DELETED` outbox event in one transaction. The event contains the deleted resource so the controller can remove its external state.
 
 ```
 DELETE
@@ -2258,19 +1971,13 @@ API server
   v
 Store.Delete
   |
-  +-- remove resource
+  +-- remove resource and save outbox event
   |
-  +-- increment revision
-  |
-  +-- send DELETED
-  |
-  v
-HTTP response
+  +--> HTTP response
+  +--> Outbox relay --> JetStream --> durable controller consumer
 ```
 
-The controller receives the deleted resource.
-
-It can then remove external state.
+After publication, the controller receives the deleted resource and removes its external state.
 
 ---
 
@@ -2288,11 +1995,7 @@ or:
 runCertificateController()
 ```
 
-This is intentional.
-
-The API server should remain generic.
-
-This allows a new controller to be added without changing the API server.
+The API server remains generic, so a new controller can be added without changing it.
 
 For example:
 
@@ -2316,9 +2019,7 @@ Each controller can be developed and deployed separately.
 
 # Controllers Communicate Through Resources
 
-Suppose a certificate controller creates a resource that another controller needs.
-
-The controllers should not call each other directly.
+If a certificate controller creates a resource that another controller needs, they should exchange information through resources instead of calling one another directly.
 
 Instead:
 
@@ -2332,9 +2033,7 @@ Certificate Controller
 Other Controller
 ```
 
-This keeps the controllers independent.
-
-It also means that one controller can be replaced without changing another controller.
+This keeps controllers independent and lets you replace one controller without changing another.
 
 ---
 
@@ -2347,7 +2046,7 @@ main
  |
  +-- register kind
  |
- +-- watch
+ +-- consume durable stream
        |
        +-- decode event
        |
@@ -2369,9 +2068,7 @@ dns-controller/
 └── types.go
 ```
 
-Start with one file for a small controller.
-
-Split the code when it becomes difficult to understand.
+Use one file for a small controller. Split the code when it becomes difficult to understand.
 
 ---
 
@@ -2396,7 +2093,7 @@ external constraints
 
 # Controller Error Handling
 
-A reconciliation error should normally not terminate the controller.
+A reconciliation error should not normally terminate the controller. Log the error and allow JetStream to redeliver the event after the configured delay.
 
 For example:
 
@@ -2406,63 +2103,25 @@ if err := reconcile(event); err != nil {
 }
 ```
 
-The controller remains alive.
-
-A later event can cause another reconciliation.
-
-A production controller should normally add retry and backoff behavior.
-
-For example:
-
-```
-reconcile
-   |
-   +-- error
-       |
-       v
-    wait
-       |
-       v
-    retry
-```
-
-The current example uses a simple reconnect delay for watch failures.
-
-It does not yet implement a complete reconciliation retry queue.
+The consumer remains active after a reconciliation error. It sends a delayed negative acknowledgment, and JetStream redelivers the event. If the consumer stops, the controller reconnects to NATS and resumes its durable consumer.
 
 ---
 
 # Logging
 
-Controllers should log enough information to identify a resource.
-
-A useful log entry includes:
-
-```
-kind
-name
-namespace
-generation
-resourceVersion
-```
-
-For example:
+Include the resource kind, name, namespace, generation, and resource version in logs. For example:
 
 ```
 RECONCILE DNSRecord/example generation=2 resourceVersion=7
 ```
 
-This makes troubleshooting easier.
-
-Avoid logging sensitive information.
+These fields help identify the resource during troubleshooting. Do not log sensitive information.
 
 ---
 
 # Resource Version and Generation
 
-These two fields have different purposes.
-
-`generation` represents the desired configuration version.
+`generation` represents the desired configuration version. It changes when `spec` changes.
 
 Example:
 
@@ -2472,11 +2131,7 @@ generation 2
 generation 3
 ```
 
-It changes when the desired `spec` changes.
-
-`resourceVersion` identifies a store revision.
-
-It can change when the resource is updated.
+`resourceVersion` identifies a stored revision and changes when the resource is created or updated.
 
 The distinction is:
 
@@ -2490,63 +2145,40 @@ resourceVersion
     +-- stored resource changed
 ```
 
-A controller can use `generation` when it wants to know whether it has processed the latest desired configuration.
+A controller can compare `generation` to determine whether it processed the latest desired configuration. It can use `resourceVersion` to identify the stored revision it observed.
 
 ---
 
-# Current Storage Limitations
+# Resource Storage and Event Delivery
 
-The API server persists resources and resource-kind registrations, including schemas, in SQLite or PostgreSQL. SQLite is the default. Active watch connections and historical watch events are not persisted. After a restart, controllers must reconnect and reconcile from the current resource snapshot; intermediate events are not replayed.
+The API server stores resources, kinds, schemas, and pending outbox events in SQLite or PostgreSQL. A resource mutation and its event enter the database in one transaction. The API server publishes pending events to the matching JetStream stream and removes each outbox row after JetStream confirms the publish. A crash can cause a duplicate publish, so consumers must handle events idempotently.
 
----
-
-# Current Watch Limitations
-
-The current watch implementation is intentionally simple.
-
-A watch connection receives:
-
-```
-current resources
-+
-future changes
-```
-
-It does not provide a historical event log.
-
-For example, if a controller is offline while these events occur:
-
-```
-CREATE A
-UPDATE A
-DELETE A
-```
-
-the controller does not receive those historical events when it reconnects.
-
-Instead, it receives the current state.
-
-This works well with a level-triggered reconciliation model.
-
-However, if a future application requires guaranteed event history, the API server needs a durable event mechanism.
+Per-kind JetStream streams use file storage and retain messages for seven days. Controllers use durable consumers and acknowledge events after reconciliation succeeds. Unacknowledged events can be delivered again. Events older than the retention period are removed.
 
 ---
 
-# Current API Server Persistence Model
+# HTTP Watch Behavior
 
-The current architecture is:
+`GET /api/v1/watch` sends the current matching resources as `ADDED` events, then streams new changes as NDJSON. The endpoint stores active connections and watcher state in API-server memory. An API-server restart closes these connections, so HTTP clients must reconnect and receive a new snapshot. Controllers do not use this endpoint; they consume durable JetStream streams.
+
+---
+
+# API Server Persistence Model
+
+The API server persists state in SQL and publishes resource events to JetStream:
 
 ```
-HTTP
- |
- v
-API server
- |
- v
-ResourceStore
- |
- +-- SQLite or PostgreSQL: resources and kinds
- +-- API-server memory: active watchers
+REST clients and cpctl
+        |
+        | HTTP
+        v
+    API server -------> NATS JetStream <------- Controllers
+        |                                      |
+        v                                      v
+   ResourceStore                         External systems
+        |
+        +-- SQLite or PostgreSQL: resources, kinds, and outbox
+        +-- API-server memory: active HTTP watchers
 ```
 
 The controller API does not depend on which storage backend is selected.
@@ -2555,20 +2187,16 @@ The controller API does not depend on which storage backend is selected.
 
 # Persistent Storage
 
-The API server uses a persistent storage layer to keep resource state across API-server restarts.
-
-The storage layer is intentionally separated from the API server. The API server does not contain database-specific logic. It uses a common `ResourceStore` interface, and different storage implementations can provide the actual persistence mechanism.
-
-The current implementation supports:
+The API server uses a persistent storage layer to preserve resource state across restarts. It depends on the `ResourceStore` interface, not database-specific code. The current implementations support:
 
 * SQLite
 * PostgreSQL
 
-The default storage backend is SQLite.
+SQLite is the default backend.
 
 ### Storage Architecture
 
-The API server uses the following architecture:
+The API server uses this architecture:
 
 ```
                          API Server
@@ -2586,27 +2214,15 @@ The API server uses the following architecture:
           controlplane.db       PostgreSQL database
 ```
 
-The API server is responsible for the HTTP API, resource validation, and watch connections.
-
-The storage implementation is responsible for persistent resource state.
-
-Controllers do not access the database directly. Controllers communicate only with the API server.
+The API server validates and stores resources, writes outbox events, serves the REST API, and publishes events to JetStream. Controllers use JetStream for kind registration and event delivery; they do not access the database directly.
 
 ```
-Controller
-    |
-    | HTTP
-    v
-API Server
-    |
-    | ResourceStore
-    v
-Database
+API clients --HTTP--> API server --ResourceStore--> Database
+               |
+               +--NATS JetStream--> Controllers
 ```
 
-This separation is important because a controller must not depend on the storage implementation.
-
-A DNS controller can therefore work with SQLite, PostgreSQL, or a future storage implementation without any changes to the controller.
+This separation lets the API server change storage implementations without requiring controller changes.
 
 ### Resource Storage
 
@@ -2622,9 +2238,7 @@ type Resource struct {
 }
 ```
 
-The storage layer does not need to understand the contents of `spec` or `status`.
-
-For example, these resources can all be stored using the same mechanism:
+The storage layer stores `spec` and `status` as JSON and does not interpret them. It can store different resource kinds through the same mechanism, including:
 
 ```
 DNSRecord
@@ -2634,11 +2248,11 @@ DHCPReservation
 PKIResource
 ```
 
-The API server validates `spec` against the JSON Schema registered for its kind, then stores it as JSON. The storage layer does not interpret resource fields. The owning controller understands their meaning and manages `status`.
+The API server validates `spec` against the kind's registered JSON Schema, then stores it as JSON. The owning controller interprets the fields and manages `status`.
 
 ### Resource Identity
 
-A resource is uniquely identified by:
+A resource is uniquely identified by `apiVersion`, `kind`, `namespace`, and `name`. For example:
 
 ```
 apiVersion
@@ -2653,9 +2267,7 @@ For example:
 v1 / DNSRecord / default / example
 ```
 
-This allows different resource kinds to use the same name without conflict.
-
-For example:
+Different kinds can therefore use the same name without conflict. For example:
 
 ```
 v1 / DNSRecord / default / example
@@ -2664,15 +2276,11 @@ v1 / Certificate / default / example
 
 are different resources.
 
-Each resource also receives a unique `uid` when it is created.
-
-The `uid` remains stable for the lifetime of the resource.
+The API server assigns each resource a unique `uid` at creation. The UID remains stable for the resource's lifetime.
 
 ### Resource Version
 
-Every resource receives a monotonically increasing `resourceVersion`.
-
-For example:
+Every resource receives a monotonically increasing `resourceVersion`. For example:
 
 ```
 resourceVersion = 1
@@ -2681,23 +2289,11 @@ resourceVersion = 3
 resourceVersion = 4
 ```
 
-The resource version changes whenever a resource is created or updated.
-
-The version is generated by the persistent storage layer.
-
-This is important because controllers use resource versions to reason about changes to resources.
-
-The resource version is also persisted. It is therefore not reset when the API server restarts.
+The storage layer generates and persists the version when a resource is created or updated. It is not reset when the API server restarts, so controllers can use it to identify the stored revision.
 
 ### Generation
 
-Each resource also has a `generation`.
-
-The generation starts at `1` when the resource is created.
-
-When the desired resource configuration changes, the generation is incremented.
-
-For example:
+Each resource has a `generation` that starts at `1` and increases when its desired configuration changes. For example:
 
 ```
 Create:
@@ -2710,15 +2306,11 @@ Update:
 generation = 3
 ```
 
-Controllers can use the generation to determine whether they have reconciled the current desired configuration.
-
-The storage layer does not need to understand what the generation means. It only maintains the value.
+Controllers can use the generation to determine whether they have reconciled the latest desired configuration. The storage layer maintains the value but does not interpret it.
 
 ### Resource Kinds
 
-Resource kinds are also persisted.
-
-Controllers register their resource kinds through:
+Resource kinds are persisted. Controllers publish definitions to the JetStream registration stream; the API server validates and stores each definition, creates its event stream, and acknowledges registration. Administrative clients can also register a kind through:
 
 ```
 POST /api/v1/kinds
@@ -2735,17 +2327,13 @@ For example:
 }
 ```
 
-The API server stores this registration.
-
-This means that kind registration survives an API-server restart when persistent storage is enabled.
-
-The list of registered kinds can be retrieved with:
+The storage backend keeps kind definitions across API-server restarts. Clients can list registered kinds with:
 
 ```
 GET /api/v1/kinds
 ```
 
-This allows clients to discover which resource types are available without the API server having a hard-coded list of controllers.
+This lets clients discover available resource types without a hard-coded controller list in the API server.
 
 ### SQLite
 
@@ -2886,11 +2474,7 @@ For example, a `DNSRecord` might contain:
 }
 ```
 
-The DNS controller reads this resource and makes the external DNS system match the desired state.
-
-The controller does not need a private database containing a second copy of the DNS record.
-
-The same principle applies to other controllers.
+The DNS controller reads this resource and makes the external DNS system match the desired state. It does not need a private database with a second copy of the DNS record. The same principle applies to other controllers.
 
 For example:
 
@@ -2907,17 +2491,11 @@ Terraform
 AWS
 ```
 
-The API server stores the desired `TerraformStack` resource and its status.
-
-Terraform remains responsible for its own Terraform state.
-
-This prevents multiple systems from becoming competing sources of truth.
+The API server stores the desired `TerraformStack` resource and its status, while Terraform remains responsible for its own state. This prevents multiple systems from becoming competing sources of truth.
 
 ### Persistence and Controller Restarts
 
-Persistent storage also changes what happens when a controller stops.
-
-Suppose a user creates a resource while the controller is not running:
+The API server stores a resource even when its controller is offline. It saves the matching event in the SQL outbox and publishes it to JetStream:
 
 ```
 User
@@ -2930,32 +2508,19 @@ API Server
 Database
 ```
 
-The resource is stored even though the DNS controller is offline.
-
-Later, the controller starts:
+When the controller starts, it registers its kind and resumes its durable consumer:
 
 ```
-DNS Controller
-      |
-      | LIST / WATCH
-      v
-API Server
-      |
-      v
-Database
+DNS Controller --> NATS JetStream --> API Server
+   |                                |
+   +-- durable consumer            +-- resource API and database
 ```
 
-The controller receives the existing resource and reconciles it.
-
-This is a key property of the architecture.
-
-Controllers are workers that reconcile persistent desired state. They are not the owners of that state.
+The durable consumer receives retained events that it has not acknowledged. The controller can also query the API server for current state. Controllers reconcile desired state; they do not own it.
 
 ### API Server Restart
 
-The API server can also restart without losing resources.
-
-Before the restart:
+The API server can restart without losing resources, kinds, or pending outbox events. Before the restart:
 
 ```
 Database
@@ -2965,11 +2530,7 @@ Database
     +-- TerraformStack/network
 ```
 
-The API server stops.
-
-The database remains available.
-
-After the API server starts:
+After the API server starts, it reconnects to the database and JetStream:
 
 ```
 API Server
@@ -2982,15 +2543,11 @@ Database
     +-- TerraformStack/network
 ```
 
-The resources are still present.
-
-Controllers can reconnect and reconcile the current state.
+The resources remain in the database. After restart, controllers reconnect through their durable JetStream consumers and resume reconciliation.
 
 ### Watch State
 
-Resource state is persistent, but active watch connections are not.
-
-Watch connections exist only in API-server memory:
+Resources, kinds, outbox events, and JetStream messages are persistent. Active HTTP watch connections exist only in API-server memory:
 
 ```
 Database
@@ -3005,17 +2562,11 @@ API Server memory
     +-- Active watchers
 ```
 
-When the API server stops, the watch connections are lost.
-
-Controllers are expected to reconnect.
-
-When a controller reconnects, it can obtain the current resource state and continue reconciliation.
-
-This follows the level-triggered controller model. Controllers should not depend on receiving every historical event in order to recover.
+When the API server stops, HTTP watch connections close, and HTTP clients must reconnect. Controllers reconnect to JetStream and resume their durable consumers. After the seven-day retention period, a controller must query current resource state to restore external state.
 
 ### Storage Abstraction
 
-The storage interface is defined independently of the database implementation.
+The `ResourceStore` interface is independent of the database implementation:
 
 Conceptually:
 
@@ -3028,15 +2579,14 @@ type ResourceStore interface {
     Delete(...)
 
     RegisterKind(...)
+    DeleteKind(...)
     ListKinds(...)
+    ListPendingEvents(...)
+    MarkEventPublished(...)
 }
 ```
 
-The API server depends on this interface rather than directly depending on SQLite or PostgreSQL.
-
-This makes it possible to add another storage implementation later without changing the API layer.
-
-For example:
+The API server depends on this interface rather than SQLite or PostgreSQL directly. You can add another storage implementation without changing the API layer. For example:
 
 ```
 ResourceStore
@@ -3084,9 +2634,7 @@ The controller configuration does not change when the storage backend changes.
 
 ### Storage and Watch Events
 
-The database is the source of truth.
-
-A resource operation follows this general sequence:
+The database is the source of truth for resources. A resource operation writes the resource and its outbox event in one database transaction. The API server then publishes the event to JetStream:
 
 ```
 Client
@@ -3101,37 +2649,23 @@ Persistent Storage
   |
   | commit
   v
-API Server
-  |
-  | watch event
-  v
-Controllers
+API server --JetStream publish--> Per-kind event stream --> Durable consumers
 ```
 
-The important ordering is that the persistent state is updated before the corresponding watch event is published.
+The database commit occurs before JetStream publication. The outbox preserves events that are waiting for publication. If a controller misses an event after the seven-day retention period, it can query the API server and reconcile the current state.
 
-A watch event is therefore a notification that persistent state changed. It is not the persistent state itself.
+### Possible Storage Improvements
 
-If a controller misses a watch event, it can query the API server and obtain the current state.
-
-### Future Storage Improvements
-
-The current implementation provides persistent resource storage and an in-memory watch mechanism.
-
-Possible future improvements include:
+The implementation provides persistent resources, kinds, and an outbox. HTTP watch connections remain in memory. Possible improvements include:
 
 * PostgreSQL `LISTEN/NOTIFY` for API-server instances that share one PostgreSQL database
-* Persistent event history
-* Resource-version based watch recovery
 * Optimistic concurrency using resource versions
 * Database connection pooling configuration
 * Automatic database migrations
 * Database backup and restore tooling
 * High-availability API-server deployments
 
-These improvements do not require changing the resource model or controller API.
-
-The central design remains:
+These improvements do not require changing the resource model or controller API. The current event flow is:
 
 ```
                 Persistent Desired State
@@ -3141,7 +2675,7 @@ The central design remains:
                          |
                  +-------+-------+
                  |               |
-              LIST/GET        WATCH
+                REST API     JetStream
                  |               |
                  v               v
              Controllers    Controllers
@@ -3150,15 +2684,17 @@ The central design remains:
           External Systems
 ```
 
-The database provides durable state. The API server provides the resource API. Controllers provide reconciliation logic. Each component has a separate responsibility.
+The database provides durable desired state. The API server provides the resource API and event publisher. JetStream provides retained event delivery. Controllers provide reconciliation logic.
 
 ---
 
 # Security Considerations
 
-The current API server is intended for development.
+The NATS server uses separate administrator and application accounts. The application account has permissions for Controlplane registration, event, inbox, and JetStream API subjects. The local passwords are development defaults; set `NATS_ADMIN_PASSWORD`, `NATS_APP_USERNAME`, and `NATS_APP_PASSWORD` before using the server outside local development. NATS TLS is not enabled by default.
 
-It does not provide production-grade security features such as:
+The HTTP API does not provide authentication, authorization, or TLS. It listens on all network interfaces by default. Do not expose it to an untrusted network. A production deployment must define access rules for resource CRUD, watches, and kind registration.
+
+The current API server does not provide production-grade security features such as:
 
 ```
 TLS
@@ -3168,35 +2704,17 @@ audit logging
 network access control
 ```
 
-Do not expose the development API server directly to an untrusted network.
-
-A production implementation should define:
-
-```
-Who can create resources?
-Who can update resources?
-Who can delete resources?
-Who can watch resources?
-Who can register resource kinds?
-```
-
-Authentication and authorization should be added before exposing the API to untrusted clients.
-
 ---
 
 # Production Improvements
 
-The current implementation is a small control-plane foundation.
-
-A production system can add:
+The current implementation can be extended with:
 
 ```
 authentication
 authorization
 TLS
 optimistic concurrency
-durable watch history
-watch resource versions
 controller work queues
 retry backoff
 health endpoints
@@ -3208,33 +2726,29 @@ graceful shutdown
 configuration management
 ```
 
-These features should be added only when they are needed.
-
-Keep the generic core small.
+Add these features to meet deployment requirements while keeping controller-specific logic outside the API server.
 
 ---
 
 # Testing Controllers
 
-A controller should be tested independently.
-
-The project includes integration testing through:
+A controller should be tested independently. The project provides API CRUD integration scripts through:
 
 ```bash
 task test-controllers
 ```
 
-The test process can:
+The scripts discover registered kinds, then:
 
 ```
 create resources
 update resources
 delete resources
-verify controller activity
+verify API responses
 clean up resources
 ```
 
-A controller test should verify behavior rather than only verify that an HTTP request returned `200`.
+A controller behavior test should verify reconciliation in the external system, not only an HTTP status. The current scripts verify resource CRUD and cleanup; they do not assert changes to a real external system.
 
 For example:
 
@@ -3270,245 +2784,77 @@ DNS state removed
 
 # Recommended Controller Development Process
 
-Use this sequence when creating a new controller.
+Use this sequence to create a controller:
 
-## Define the resource
-
-Decide:
-
-```
-kind
-apiVersion
-spec
-status
-spec schema
-```
-
-Keep the specification small.
-
-## Register the kind
-
-Register the kind and its JSON Schema for `spec` with:
-
-```
-POST /api/v1/kinds
-```
-
-to the controller startup process.
-
-## Create the watch
-
-Watch only the resource kinds that the controller needs.
-
-## Implement reconciliation
-
-Handle:
-
-```
-ADDED
-MODIFIED
-DELETED
-```
-
-## Make reconciliation idempotent
-
-Running reconciliation more than once must be safe.
-
-## Validate the resource
-
-Validate domain-specific rules and external-system constraints that the schema cannot express.
-
-## Handle external failures
-
-Do not terminate the controller because an external system is temporarily unavailable.
-
-## Add tests
-
-Test create, update, delete, restart, and error conditions.
-
-## Add logging
-
-Include resource identity in log messages.
-
-## Add the controller to the build
-
-Update the Taskfile.
+1. Define the resource kind, API version, specification, schema, and optional status fields.
+2. Register the kind with `messaging.Client.RegisterKind` and wait for the API server's acknowledgment.
+3. Create a stable durable consumer for the kind's event stream.
+4. Reconcile `ADDED`, `MODIFIED`, and `DELETED` events. Acknowledge an event only after reconciliation succeeds.
+5. Make reconciliation idempotent and validate domain-specific rules that the schema cannot express.
+6. Retry external-system failures without terminating the controller.
+7. Test create, update, delete, restart, and failure behavior. Include resource identity in log messages.
+8. Add build and run tasks to the Taskfile.
 
 ---
 
 # Complete Controller Pattern
 
-A small controller can follow this pattern:
+A controller connects to NATS, registers its kind, and starts a durable consumer. The consumer acknowledges an event only after reconciliation succeeds.
 
 ```go
-package main
-
 import (
-    "bufio"
-    "bytes"
-    "encoding/json"
-    "fmt"
-    "io"
-    "log"
-    "net/http"
-    "time"
+  "context"
+  "fmt"
 
-    "controlplane/protocol"
+  "controlplane/messaging"
+  "controlplane/protocol"
 )
 
-const apiServerURL = "http://localhost:8080"
-
 var resourceKind = protocol.ResourceKind{
-    APIVersion: "v1",
-    Kind:       "ExampleResource",
-    Resource:   "exampleresources",
-    Namespaced: true,
-    Schema: map[string]any{
-      "type":     "object",
-      "required": []string{"name"},
-      "properties": map[string]any{
-        "name": map[string]any{"type": "string", "minLength": 1},
-      },
-      "additionalProperties": false,
-    },
+  APIVersion: "v1",
+  Kind:       "ExampleResource",
+  Resource:   "exampleresources",
+  Namespaced: true,
 }
 
-func main() {
-    log.Println("controller started")
+func run(ctx context.Context) error {
+  broker, err := messaging.Connect(messaging.URLFromEnv(), "example-controller")
+  if err != nil {
+    return err
+  }
+  defer broker.Close()
 
-    if err := registerKind(); err != nil {
-        log.Fatalf("failed to register resource kind: %v", err)
-    }
+  if err := broker.RegisterKind(ctx, resourceKind); err != nil {
+    return err
+  }
 
-    for {
-        if err := watch(); err != nil {
-            log.Printf("watch failed: %v", err)
-            log.Println("reconnecting in 2 seconds")
-            time.Sleep(2 * time.Second)
-        }
-    }
-}
-
-func registerKind() error {
-    body, err := json.Marshal(resourceKind)
-    if err != nil {
-        return err
-    }
-
-    response, err := http.Post(
-        apiServerURL+"/api/v1/kinds",
-        "application/json",
-        bytes.NewReader(body),
-    )
-    if err != nil {
-        return err
-    }
-
-    defer response.Body.Close()
-
-    if response.StatusCode != http.StatusCreated {
-        responseBody, _ := io.ReadAll(response.Body)
-
-        return fmt.Errorf(
-            "kind registration returned HTTP %d: %s",
-            response.StatusCode,
-            string(responseBody),
-        )
-    }
-
-    return nil
-}
-
-func watch() error {
-    watchURL := apiServerURL +
-        "/api/v1/watch?apiVersion=v1&kind=ExampleResource"
-
-    response, err := http.Get(watchURL)
-    if err != nil {
-        return err
-    }
-
-    defer response.Body.Close()
-
-    if response.StatusCode != http.StatusOK {
-        body, _ := io.ReadAll(response.Body)
-
-        return fmt.Errorf(
-            "watch returned HTTP %d: %s",
-            response.StatusCode,
-            string(body),
-        )
-    }
-
-    log.Println("watch connected")
-
-    scanner := bufio.NewScanner(response.Body)
-
-    for scanner.Scan() {
-        var event protocol.WatchEvent
-
-        if err := json.Unmarshal(scanner.Bytes(), &event); err != nil {
-            log.Printf("invalid watch event: %v", err)
-            continue
-        }
-
-        if err := reconcile(event); err != nil {
-            log.Printf("reconcile failed: %v", err)
-        }
-    }
-
-    return scanner.Err()
+  durable := messaging.StableDurableName(
+    "example-controller",
+    resourceKind.APIVersion,
+    resourceKind.Kind,
+  )
+  return broker.RunKindEvents(
+    ctx,
+    resourceKind.APIVersion,
+    resourceKind.Kind,
+    durable,
+    reconcile,
+  )
 }
 
 func reconcile(event protocol.WatchEvent) error {
-    switch event.Type {
-    case protocol.Added:
-        return reconcileResource(event.Object)
-
-    case protocol.Modified:
-        return reconcileResource(event.Object)
-
-    case protocol.Deleted:
-        return deleteResource(event.Object)
-
-    default:
-        return fmt.Errorf(
-            "unknown event type %q",
-            event.Type,
-        )
-    }
-}
-
-func reconcileResource(
-    resource protocol.Resource,
-) error {
-    log.Printf(
-        "reconciling %s/%s",
-        resource.Kind,
-        resource.Metadata.Name,
-    )
-
-    // Make the external system match resource.Spec.
-
-    return nil
-}
-
-func deleteResource(
-    resource protocol.Resource,
-) error {
-    log.Printf(
-        "deleting external state for %s/%s",
-        resource.Kind,
-        resource.Metadata.Name,
-    )
-
-    // Remove external state.
-
-    return nil
+  switch event.Type {
+  case protocol.Added, protocol.Modified:
+    return reconcileResource(event.Object)
+  case protocol.Deleted:
+    return deleteResource(event.Object)
+  default:
+    return fmt.Errorf("unknown event type %q", event.Type)
+  }
 }
 ```
 
-This pattern is enough to build a basic controller.
+`reconcileResource` and `deleteResource` must be idempotent. They contain the application-specific work that makes the external system match the resource.
 
 ---
 
@@ -3530,55 +2876,43 @@ The API server must remain generic.
 
 ## Depend on event history
 
-Do not assume that every event will always be delivered.
-
-A controller must be able to reconstruct the desired state from the current resource.
+JetStream provides at-least-once delivery and retains events for seven days. Do not assume exactly-once delivery or indefinite history. A controller must be able to reconstruct desired state from the current resource.
 
 ---
 
 ## Make reconciliation non-idempotent
 
-Avoid code that creates duplicate external objects every time it receives an event.
-
-Instead, first determine the actual external state.
-
-Then change it only when necessary.
+To avoid duplicate external objects, check the actual external state first and change it only when necessary.
 
 ---
 
 ## Ignore delete events
 
-If the controller creates external state, it normally must also remove that state when the resource is deleted.
+If a controller creates external state, it must normally remove that state when the resource is deleted.
 
 ---
 
 ## Stop the controller on one external error
 
-External systems can fail temporarily.
-
-A controller should normally retry.
+External systems can fail temporarily. A controller should remain active and retry the operation.
 
 ---
 
 ## Assume `spec` is valid
 
-The API server validates `spec` against the kind's registered schema. A controller must still check domain-specific rules and external-system constraints.
+The API server validates `spec` against the kind's registered schema. A controller must also check domain-specific rules and external-system constraints.
 
 ---
 
 ## Store controller state only in memory
 
-A controller may restart.
-
-Do not depend on controller memory for the desired state.
-
-The API server resource should contain the desired state.
+A controller may restart, so do not keep the only copy of desired state in controller memory. Store desired state in an API resource.
 
 ---
 
 # Recommended Mental Model
 
-When developing a controller, think about the system this way:
+When developing a controller, compare desired state in the resource with actual state in the external system. Change the external system until the two states match:
 
 ```
 Resource
@@ -3596,46 +2930,18 @@ Controller
 External system
 ```
 
-The controller asks:
-
-```
-What should exist?
-```
-
-from the resource.
-
-Then it asks:
-
-```
-What exists now?
-```
-
-from the external system.
-
-Then it changes the external system until:
-
 ```
 desired state == actual state
 ```
-
-This is reconciliation.
 
 ---
 
 # Complete API Reference
 
-The following is the complete API reference for the current implementation.
-
 ## Kind discovery
 
 ```
 GET /api/v1/kinds
-```
-
-Arguments:
-
-```
-none
 ```
 
 Returns all registered resource kinds.
@@ -3667,6 +2973,18 @@ Request body:
 ```
 
 `schema` is optional. When provided, it validates the resource's `spec` on create and update.
+
+## Kind details
+
+Use the kind's API version and name to read, update, or delete a kind:
+
+```
+GET    /api/v1/kinds/{apiVersion}/{kind}
+PUT    /api/v1/kinds/{apiVersion}/{kind}
+DELETE /api/v1/kinds/{apiVersion}/{kind}
+```
+
+`PUT` uses the same kind definition as registration. `DELETE` returns a conflict if resources still use the kind.
 
 ---
 
@@ -3717,7 +3035,7 @@ Example:
 ## Resource collection
 
 ```
-GET /api/v1/{kind}
+GET /api/{apiVersion}/{kind}
 ```
 
 Optional query argument:
@@ -3737,7 +3055,7 @@ GET /api/v1/DNSRecord?namespace=default
 ## Create resource
 
 ```
-POST /api/v1/{kind}
+POST /api/{apiVersion}/{kind}
 ```
 
 Request body:
@@ -3762,7 +3080,7 @@ Request body:
 ## Read resource
 
 ```
-GET /api/v1/{kind}/{name}
+GET /api/{apiVersion}/{kind}/{name}
 ```
 
 Optional query argument:
@@ -3782,7 +3100,7 @@ GET /api/v1/DNSRecord/example?namespace=default
 ## Update resource
 
 ```
-PUT /api/v1/{kind}/{name}
+PUT /api/{apiVersion}/{kind}/{name}
 ```
 
 Request body contains the complete resource.
@@ -3798,7 +3116,7 @@ PUT /api/v1/DNSRecord/example
 ## Delete resource
 
 ```
-DELETE /api/v1/{kind}/{name}
+DELETE /api/{apiVersion}/{kind}/{name}
 ```
 
 Optional query argument:
@@ -3817,26 +3135,21 @@ DELETE /api/v1/DNSRecord/example?namespace=default
 
 # Final Architecture
 
-The complete current architecture can be represented as:
+The current request and event paths are:
 
 ```
-                         +----------------------+
-                         |      API Server      |
-                         |                      |
-                         | REST API             |
-                         | Resource Store       |
-                         | Kind Registry        |
-                         | Watch Manager        |
-                         +----------+-----------+
-                                    |
-              +---------------------+---------------------+
-              |                     |                     |
-              v                     v                     v
-        DNS Controller       Certificate Controller   Other Controllers
-              |                     |                     |
-              v                     v                     v
-         DNS system             PKI / ACME           External systems
+                cpctl and REST clients
+                    |
+                    | HTTP REST API
+                    v
+                  API server -------- ResourceStore --------> SQLite or PostgreSQL
+                    |
+                    | NATS JetStream
+                    v
+                   Controllers -------- reconcile --------> External systems
 ```
+
+    HTTP watch clients connect to the API server for a snapshot and live NDJSON events.
 
 The important dependency direction is:
 
@@ -3853,95 +3166,16 @@ protocol
    +---- Future controllers
 ```
 
-The API server does not depend on any specific controller.
-
-A controller depends on the API protocol.
-
-This allows the system to grow without turning the API server into a large collection of application-specific logic.
+The API server does not depend on controller-specific logic. Controllers share the protocol types and use JetStream for registration and event delivery.
 
 ---
 
 # Summary
 
-Controlplane is a generic resource-oriented control plane.
+Controlplane stores desired state as resources. The API server provides resource and kind CRUD, schema validation, and resource listing. Each successful resource mutation writes an event to the SQL outbox. The API server publishes outbox events to a per-kind JetStream stream.
 
-The API server provides:
+Controllers register kinds through the registration stream and consume events through durable JetStream consumers. Delivery is at least once, and streams retain events for seven days. Controllers must make reconciliation idempotent and use the API server's current resource state after outages that exceed event retention.
 
-```
-resource storage
-resource CRUD
-resource listing
-resource discovery
-resource watching
-```
+`cpctl` lists endpoints, manages resources and kinds from YAML files, and watches HTTP events. The separate HTTP watch endpoint sends an initial resource snapshot and then NDJSON events. Its active connections are held in API-server memory.
 
-The API server does not know what individual resources mean.
-
-Controllers provide the application-specific behavior.
-
-A controller:
-
-```
-registers a resource kind
-watches resources
-receives events
-reconciles desired state
-updates an external system
-handles deletion
-reconnects after failures
-```
-
-The most important design rule is:
-
-```
-API server = generic state management
-
-Controller = domain-specific reconciliation
-```
-
-When you add a new infrastructure feature, prefer creating a new resource kind and a new controller.
-
-For example:
-
-```
-DNSRecord
-    -> DNS controller
-
-Certificate
-    -> Certificate controller
-
-DHCPReservation
-    -> DHCP controller
-
-FirewallRule
-    -> Firewall controller
-
-LoadBalancer
-    -> Load balancer controller
-```
-
-This keeps the system modular.
-
-A controller can be stopped and restarted.
-
-The desired state remains in the API server.
-
-When the controller starts again, it reads the current state through the watch API and reconciles it.
-
-This makes controllers independent, replaceable, and easier to test.
-
-The current implementation is intentionally small. It provides the core architecture without adding persistence, authentication, authorization, durable event history, or other production features.
-
-Those features can be added later without changing the fundamental controller model.
-
-The core rule remains:
-
-```
-Resources describe desired state.
-
-The API server stores desired state.
-
-Controllers reconcile desired state with actual state.
-```
-
-That is the foundation of the Controlplane architecture.
+SQLite is the default storage backend. PostgreSQL is also supported. The NATS configuration uses persistent JetStream storage under `.nats/jetstream` for local runs.

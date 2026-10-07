@@ -94,6 +94,11 @@ func (s *PostgresStore) migrate() error {
 
 		ALTER TABLE resource_kinds
 		ADD COLUMN IF NOT EXISTS schema JSONB NOT NULL DEFAULT '{}'::jsonb;
+
+		CREATE TABLE IF NOT EXISTS event_outbox (
+			id BIGSERIAL PRIMARY KEY,
+			payload JSONB NOT NULL
+		);
 	`)
 
 	return err
@@ -176,6 +181,9 @@ func (s *PostgresStore) Create(ctx context.Context, resource protocol.Resource) 
 			return protocol.Resource{}, ErrAlreadyExists
 		}
 
+		return protocol.Resource{}, err
+	}
+	if err := enqueuePostgresEvent(ctx, tx, protocol.WatchEvent{Type: protocol.Added, Object: resource}); err != nil {
 		return protocol.Resource{}, err
 	}
 
@@ -378,6 +386,9 @@ func (s *PostgresStore) Update(ctx context.Context, resource protocol.Resource) 
 	if err != nil {
 		return protocol.Resource{}, err
 	}
+	if err := enqueuePostgresEvent(ctx, tx, protocol.WatchEvent{Type: protocol.Modified, Object: resource}); err != nil {
+		return protocol.Resource{}, err
+	}
 
 	if err := tx.Commit(); err != nil {
 		return protocol.Resource{}, err
@@ -415,6 +426,9 @@ func (s *PostgresStore) Delete(ctx context.Context, apiVersion, kind, namespace,
 	)
 
 	if err != nil {
+		return protocol.Resource{}, err
+	}
+	if err := enqueuePostgresEvent(ctx, tx, protocol.WatchEvent{Type: protocol.Deleted, Object: resource}); err != nil {
 		return protocol.Resource{}, err
 	}
 
@@ -461,6 +475,39 @@ func (s *PostgresStore) RegisterKind(ctx context.Context, kind protocol.Resource
 	return err
 }
 
+func (s *PostgresStore) DeleteKind(ctx context.Context, apiVersion, kind string) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	var resourceCount int
+	if err := tx.QueryRowContext(ctx, `
+		SELECT COUNT(*) FROM resources WHERE api_version = $1 AND kind = $2
+		`, apiVersion, kind).Scan(&resourceCount); err != nil {
+		return err
+	}
+	if resourceCount > 0 {
+		return ErrKindInUse
+	}
+
+	result, err := tx.ExecContext(ctx, `
+		DELETE FROM resource_kinds WHERE api_version = $1 AND kind = $2
+		`, apiVersion, kind)
+	if err != nil {
+		return err
+	}
+	deleted, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if deleted == 0 {
+		return ErrKindNotFound
+	}
+	return tx.Commit()
+}
+
 func (s *PostgresStore) ListKinds(ctx context.Context) ([]protocol.ResourceKind, error) {
 	rows, err := s.db.QueryContext(ctx, `
 		SELECT
@@ -495,6 +542,50 @@ func (s *PostgresStore) ListKinds(ctx context.Context) ([]protocol.ResourceKind,
 	}
 
 	return kinds, rows.Err()
+}
+
+func (s *PostgresStore) ListPendingEvents(ctx context.Context, limit int) ([]OutboxEvent, error) {
+	if limit <= 0 {
+		limit = 100
+	}
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT id, payload
+		FROM event_outbox
+		ORDER BY id
+		LIMIT $1
+		`, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var events []OutboxEvent
+	for rows.Next() {
+		var event OutboxEvent
+		var payload []byte
+		if err := rows.Scan(&event.ID, &payload); err != nil {
+			return nil, err
+		}
+		if err := json.Unmarshal(payload, &event.Event); err != nil {
+			return nil, err
+		}
+		events = append(events, event)
+	}
+	return events, rows.Err()
+}
+
+func (s *PostgresStore) MarkEventPublished(ctx context.Context, id int64) error {
+	_, err := s.db.ExecContext(ctx, "DELETE FROM event_outbox WHERE id = $1", id)
+	return err
+}
+
+func enqueuePostgresEvent(ctx context.Context, tx *sql.Tx, event protocol.WatchEvent) error {
+	payload, err := json.Marshal(event)
+	if err != nil {
+		return err
+	}
+	_, err = tx.ExecContext(ctx, "INSERT INTO event_outbox(payload) VALUES ($1)", payload)
+	return err
 }
 
 func scanPostgresResource(s scanner) (protocol.Resource, error) {

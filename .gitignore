@@ -1,4 +1,5 @@
 bin/
+.nats/
 controlplane.db
 controlplane.db-shm
 controlplane.db-wal

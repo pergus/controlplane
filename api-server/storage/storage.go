@@ -11,6 +11,7 @@ var (
 	ErrNotFound        = errors.New("resource not found")
 	ErrAlreadyExists   = errors.New("resource already exists")
 	ErrKindNotFound    = errors.New("resource kind not found")
+	ErrKindInUse       = errors.New("resource kind still has resources")
 	ErrInvalidResource = errors.New("invalid resource")
 )
 
@@ -18,6 +19,11 @@ type ResourceFilter struct {
 	APIVersion string
 	Kind       string
 	Namespace  string
+}
+
+type OutboxEvent struct {
+	ID    int64
+	Event protocol.WatchEvent
 }
 
 type ResourceStore interface {
@@ -35,5 +41,11 @@ type ResourceStore interface {
 
 	RegisterKind(ctx context.Context, kind protocol.ResourceKind) error
 
+	DeleteKind(ctx context.Context, apiVersion, kind string) error
+
 	ListKinds(ctx context.Context) ([]protocol.ResourceKind, error)
+
+	ListPendingEvents(ctx context.Context, limit int) ([]OutboxEvent, error)
+
+	MarkEventPublished(ctx context.Context, id int64) error
 }

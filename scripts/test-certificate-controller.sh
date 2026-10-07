@@ -1,13 +1,17 @@
 #!/usr/bin/env bash
 
 set -euo pipefail
-                "hostname": "${NAME}.example.internal",
+
+API="http://localhost:8080"
+KIND="Certificate"
 COUNT=20
 
 echo "Testing certificate controller with ${COUNT} resources"
 
-for i in $(seq 1 ${COUNT}); do
-                "hostname": "updated-${NAME}.example.internal",
+for i in $(seq 1 "$COUNT"); do
+    NAME="certificate-test-${i}"
+
+    curl -fsS -X POST "${API}/api/v1/${KIND}" \
         -H "Content-Type: application/json" \
         -d "{
             \"apiVersion\": \"v1\",
@@ -16,9 +20,7 @@ for i in $(seq 1 ${COUNT}); do
                 \"name\": \"${NAME}\"
             },
             \"spec\": {
-                \"dnsNames\": [
-                    \"${NAME}.example.internal\"
-                ],
+                \"hostname\": \"${NAME}.example.internal\",
                 \"issuer\": \"internal-ca\"
             }
         }" > /dev/null
@@ -28,10 +30,10 @@ done
 
 echo "Checking created certificates"
 
-for i in $(seq 1 ${COUNT}); do
+for i in $(seq 1 "$COUNT"); do
     NAME="certificate-test-${i}"
 
-    RESULT=$(curl -s "${API}/api/v1/${KIND}/${NAME}")
+    RESULT=$(curl -fsS "${API}/api/v1/${KIND}/${NAME}")
 
     echo "${RESULT}" | grep -q "${NAME}"
 
@@ -40,10 +42,10 @@ done
 
 echo "Updating certificates"
 
-for i in $(seq 1 ${COUNT}); do
+for i in $(seq 1 "$COUNT"); do
     NAME="certificate-test-${i}"
 
-    curl -s -X PUT "${API}/api/v1/${KIND}/${NAME}" \
+    curl -fsS -X PUT "${API}/api/v1/${KIND}/${NAME}" \
         -H "Content-Type: application/json" \
         -d "{
             \"apiVersion\": \"v1\",
@@ -52,9 +54,7 @@ for i in $(seq 1 ${COUNT}); do
                 \"name\": \"${NAME}\"
             },
             \"spec\": {
-                \"dnsNames\": [
-                    \"updated-${NAME}.example.internal\"
-                ],
+                \"hostname\": \"updated-${NAME}.example.internal\",
                 \"issuer\": \"internal-ca\"
             }
         }" > /dev/null
@@ -64,19 +64,19 @@ done
 
 echo "Deleting certificates"
 
-for i in $(seq 1 ${COUNT}); do
+for i in $(seq 1 "$COUNT"); do
     NAME="certificate-test-${i}"
 
-    curl -s -X DELETE "${API}/api/v1/${KIND}/${NAME}" > /dev/null
+    curl -fsS -X DELETE "${API}/api/v1/${KIND}/${NAME}" > /dev/null
 
     echo "Deleted ${NAME}"
 done
 
 echo "Checking cleanup"
 
-RESULT=$(curl -s "${API}/api/v1/${KIND}")
+RESULT=$(curl -fsS "${API}/api/v1/${KIND}")
 
-for i in $(seq 1 ${COUNT}); do
+for i in $(seq 1 "$COUNT"); do
     NAME="certificate-test-${i}"
 
     if echo "${RESULT}" | grep -q "${NAME}"; then

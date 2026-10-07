@@ -1,21 +1,16 @@
 package main
 
 import (
-	"bufio"
-	"bytes"
-	"encoding/json"
+	"context"
 	"fmt"
-	"io"
 	"log"
-	"net/http"
+	"os/signal"
+	"syscall"
 	"time"
 
+	"controlplane/messaging"
 	"controlplane/protocol"
 )
-
-const apiServerURL = "http://localhost:8080"
-
-const watchURL = apiServerURL + "/api/v1/watch?apiVersion=v1&kind=Certificate"
 
 var certificateKind = protocol.ResourceKind{
 	APIVersion: "v1",
@@ -35,75 +30,40 @@ var certificateKind = protocol.ResourceKind{
 
 func main() {
 	log.Println("Certificate controller started")
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
 
-	if err := registerKind(); err != nil {
-		log.Fatalf("failed to register resource kind: %v", err)
+	broker, err := messaging.Connect(messaging.URLFromEnv(), "certificate-controller")
+	if err != nil {
+		log.Fatalf("failed to connect to NATS: %v", err)
 	}
+	defer broker.Close()
 
-	for {
-		if err := watch(); err != nil {
-			log.Printf("watch failed: %v", err)
-			log.Println("reconnecting in 2 seconds")
-			time.Sleep(2 * time.Second)
+	for ctx.Err() == nil {
+		if err := broker.RegisterKind(ctx, certificateKind); err != nil {
+			log.Printf("kind registration failed: %v", err)
+		} else {
+			log.Printf("registered resource kind %s/%s", certificateKind.APIVersion, certificateKind.Kind)
+			durable := messaging.StableDurableName("certificate-controller", certificateKind.APIVersion, certificateKind.Kind)
+			if err := broker.RunKindEvents(ctx, certificateKind.APIVersion, certificateKind.Kind, durable, reconcile); err != nil && ctx.Err() == nil {
+				log.Printf("event consumer stopped: %v", err)
+			}
+		}
+		if !waitBeforeRetry(ctx) {
+			return
 		}
 	}
 }
 
-func registerKind() error {
-	body, err := json.Marshal(certificateKind)
-	if err != nil {
-		return err
+func waitBeforeRetry(ctx context.Context) bool {
+	timer := time.NewTimer(2 * time.Second)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return false
+	case <-timer.C:
+		return true
 	}
-
-	response, err := http.Post(apiServerURL+"/api/v1/kinds", "application/json", bytes.NewReader(body))
-	if err != nil {
-		return err
-	}
-	defer response.Body.Close()
-
-	if response.StatusCode != http.StatusCreated {
-		responseBody, _ := io.ReadAll(response.Body)
-		return fmt.Errorf("kind registration returned HTTP %d: %s", response.StatusCode, string(responseBody))
-	}
-
-	log.Printf("registered resource kind %s/%s", certificateKind.APIVersion, certificateKind.Kind)
-
-	return nil
-}
-
-func watch() error {
-	response, err := http.Get(watchURL)
-	if err != nil {
-		return err
-	}
-	defer response.Body.Close()
-
-	if response.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(response.Body)
-		return &watchError{
-			status: response.StatusCode,
-			body:   string(body),
-		}
-	}
-
-	log.Println("watch connected")
-
-	scanner := bufio.NewScanner(response.Body)
-
-	for scanner.Scan() {
-		var event protocol.WatchEvent
-
-		if err := json.Unmarshal(scanner.Bytes(), &event); err != nil {
-			log.Printf("invalid watch event: %v", err)
-			continue
-		}
-
-		if err := reconcile(event); err != nil {
-			log.Printf("reconcile failed: %v", err)
-		}
-	}
-
-	return scanner.Err()
 }
 
 func reconcile(event protocol.WatchEvent) error {
@@ -152,13 +112,4 @@ func removeCertificate(resource protocol.Resource) error {
 	// Cleanup should be idempotent.
 
 	return nil
-}
-
-type watchError struct {
-	status int
-	body   string
-}
-
-func (e *watchError) Error() string {
-	return "watch returned HTTP " + http.StatusText(e.status) + ": " + e.body
 }

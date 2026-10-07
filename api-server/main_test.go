@@ -93,6 +93,72 @@ func TestKindRegistrationRejectsInvalidSchema(t *testing.T) {
 	}
 }
 
+func TestKindCRUD(t *testing.T) {
+	store, err := storage.NewSQLite(filepath.Join(t.TempDir(), "controlplane.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+
+	server := httptest.NewServer(NewServer(store))
+	defer server.Close()
+
+	kind := protocol.ResourceKind{
+		APIVersion: "v1",
+		Kind:       "Example",
+		Resource:   "examples",
+	}
+	registerKind(t, server.URL, kind)
+	kindURL := server.URL + "/api/v1/kinds/v1/Example"
+
+	response := request(t, http.MethodGet, kindURL, "")
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("get kind status = %d, want %d", response.StatusCode, http.StatusOK)
+	}
+	response.Body.Close()
+
+	kind.Resource = "new-examples"
+	updatedBody, err := json.Marshal(kind)
+	if err != nil {
+		t.Fatal(err)
+	}
+	response = request(t, http.MethodPut, kindURL, string(updatedBody))
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("update kind status = %d, want %d", response.StatusCode, http.StatusOK)
+	}
+	response.Body.Close()
+
+	response = request(t, http.MethodPost, server.URL+"/api/v1/Example", `{"metadata":{"name":"sample"}}`)
+	if response.StatusCode != http.StatusCreated {
+		t.Fatalf("create resource status = %d, want %d", response.StatusCode, http.StatusCreated)
+	}
+	response.Body.Close()
+
+	response = request(t, http.MethodDelete, kindURL, "")
+	if response.StatusCode != http.StatusConflict {
+		t.Fatalf("delete in-use kind status = %d, want %d", response.StatusCode, http.StatusConflict)
+	}
+	response.Body.Close()
+
+	response = request(t, http.MethodDelete, server.URL+"/api/v1/Example/sample", "")
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("delete resource status = %d, want %d", response.StatusCode, http.StatusOK)
+	}
+	response.Body.Close()
+
+	response = request(t, http.MethodDelete, kindURL, "")
+	if response.StatusCode != http.StatusNoContent {
+		t.Fatalf("delete kind status = %d, want %d", response.StatusCode, http.StatusNoContent)
+	}
+	response.Body.Close()
+
+	response = request(t, http.MethodGet, kindURL, "")
+	if response.StatusCode != http.StatusNotFound {
+		t.Fatalf("get deleted kind status = %d, want %d", response.StatusCode, http.StatusNotFound)
+	}
+	response.Body.Close()
+}
+
 func registerKind(t *testing.T, baseURL string, kind protocol.ResourceKind) {
 	t.Helper()
 

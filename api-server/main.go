@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"controlplane/api-server/storage"
+	"controlplane/messaging"
 	"controlplane/protocol"
 
 	"github.com/santhosh-tekuri/jsonschema/v5"
@@ -37,7 +38,8 @@ type Watcher struct {
 }
 
 type Server struct {
-	store storage.ResourceStore
+	store  storage.ResourceStore
+	broker *messaging.Client
 
 	mu       sync.Mutex
 	watchID  uint64
@@ -45,8 +47,13 @@ type Server struct {
 }
 
 func NewServer(store storage.ResourceStore) *Server {
+	return NewServerWithBroker(store, nil)
+}
+
+func NewServerWithBroker(store storage.ResourceStore, broker *messaging.Client) *Server {
 	return &Server{
 		store:    store,
+		broker:   broker,
 		watchers: make(map[uint64]*Watcher),
 	}
 }
@@ -58,7 +65,29 @@ func main() {
 	}
 	defer store.Close()
 
-	server := NewServer(store)
+	broker, err := messaging.Connect(messaging.URLFromEnv(), "api-server")
+	if err != nil {
+		log.Fatalf("failed to connect to NATS: %v", err)
+	}
+	defer broker.Close()
+	if err := broker.EnsureRegistrationStream(); err != nil {
+		log.Fatalf("failed to ensure kind registration stream: %v", err)
+	}
+	kinds, err := store.ListKinds(context.Background())
+	if err != nil {
+		log.Fatalf("failed to list resource kinds: %v", err)
+	}
+	for _, kind := range kinds {
+		if err := broker.EnsureKindEventStream(kind.APIVersion, kind.Kind); err != nil {
+			log.Fatalf("failed to ensure event stream for %s/%s: %v", kind.APIVersion, kind.Kind, err)
+		}
+	}
+
+	server := NewServerWithBroker(store, broker)
+	workerContext, stopWorkers := context.WithCancel(context.Background())
+	defer stopWorkers()
+	go server.runRegistrationConsumer(workerContext)
+	go server.runOutboxPublisher(workerContext)
 
 	httpServer := &http.Server{
 		Addr:              getEnv("API_SERVER_ADDRESS", defaultAddress),
@@ -144,6 +173,16 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if strings.HasPrefix(path, "api/v1/kinds/") {
+		parts := strings.Split(path, "/")
+		if len(parts) == 5 {
+			s.handleKind(w, r, parts[3], parts[4])
+			return
+		}
+		http.NotFound(w, r)
+		return
+	}
+
 	if !strings.HasPrefix(path, "api/") {
 		http.NotFound(w, r)
 		return
@@ -172,6 +211,65 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	http.NotFound(w, r)
 }
 
+func (s *Server) handleKind(w http.ResponseWriter, r *http.Request, apiVersion, kindName string) {
+	switch r.Method {
+	case http.MethodGet:
+		kinds, err := s.store.ListKinds(r.Context())
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, err)
+			return
+		}
+		for _, kind := range kinds {
+			if kind.APIVersion == apiVersion && kind.Kind == kindName {
+				writeJSON(w, http.StatusOK, kind)
+				return
+			}
+		}
+		writeStorageError(w, storage.ErrKindNotFound)
+
+	case http.MethodPut:
+		var kind protocol.ResourceKind
+		if err := decodeJSON(r, &kind); err != nil {
+			writeError(w, http.StatusBadRequest, fmt.Errorf("invalid JSON: %w", err))
+			return
+		}
+		if kind.APIVersion != apiVersion || kind.Kind != kindName {
+			writeError(w, http.StatusBadRequest, errors.New("kind apiVersion/kind does not match URL"))
+			return
+		}
+		if err := validateKind(kind); err != nil {
+			writeError(w, http.StatusBadRequest, err)
+			return
+		}
+		if err := s.registerKind(r.Context(), kind); err != nil {
+			writeError(w, http.StatusInternalServerError, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, kind)
+
+	case http.MethodDelete:
+		if err := s.store.DeleteKind(r.Context(), apiVersion, kindName); err != nil {
+			writeStorageError(w, err)
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
+
+	default:
+		w.Header().Set("Allow", "GET, PUT, DELETE")
+		http.Error(w, "method not supported", http.StatusMethodNotAllowed)
+	}
+}
+
+func validateKind(kind protocol.ResourceKind) error {
+	if kind.APIVersion == "" || kind.Kind == "" || kind.Resource == "" {
+		return errors.New("apiVersion, kind, and resource are required")
+	}
+	if _, err := compileResourceSchema(kind.Schema); err != nil {
+		return fmt.Errorf("invalid resource schema: %w", err)
+	}
+	return nil
+}
+
 func (s *Server) handleKinds(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case http.MethodGet:
@@ -197,19 +295,20 @@ func (s *Server) handleKinds(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		if kind.APIVersion == "" || kind.Kind == "" || kind.Resource == "" {
-			writeError(w, http.StatusBadRequest, errors.New("apiVersion, kind, and resource are required"))
-			return
-		}
-
-		if _, err := compileResourceSchema(kind.Schema); err != nil {
-			writeError(w, http.StatusBadRequest, fmt.Errorf("invalid resource schema: %w", err))
+		if err := validateKind(kind); err != nil {
+			writeError(w, http.StatusBadRequest, err)
 			return
 		}
 
 		if err := s.store.RegisterKind(r.Context(), kind); err != nil {
 			writeError(w, http.StatusInternalServerError, err)
 			return
+		}
+		if s.broker != nil {
+			if err := s.broker.EnsureKindEventStream(kind.APIVersion, kind.Kind); err != nil {
+				writeError(w, http.StatusInternalServerError, err)
+				return
+			}
 		}
 
 		writeJSON(w, http.StatusCreated, kind)
@@ -218,6 +317,71 @@ func (s *Server) handleKinds(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Allow", "GET, POST")
 
 		http.Error(w, "method not supported", http.StatusMethodNotAllowed)
+	}
+}
+
+func (s *Server) registerKind(ctx context.Context, kind protocol.ResourceKind) error {
+	if err := validateKind(kind); err != nil {
+		return err
+	}
+	if err := s.store.RegisterKind(ctx, kind); err != nil {
+		return err
+	}
+	if s.broker != nil {
+		return s.broker.EnsureKindEventStream(kind.APIVersion, kind.Kind)
+	}
+	return nil
+}
+
+func (s *Server) runRegistrationConsumer(ctx context.Context) {
+	for ctx.Err() == nil {
+		err := s.broker.RunRegistrations(ctx, s.registerKind)
+		if ctx.Err() != nil {
+			return
+		}
+		log.Printf("kind registration consumer stopped: %v", err)
+		if !waitForRetry(ctx) {
+			return
+		}
+	}
+}
+
+func (s *Server) runOutboxPublisher(ctx context.Context) {
+	for ctx.Err() == nil {
+		events, err := s.store.ListPendingEvents(ctx, 100)
+		shouldWait := len(events) == 0 || err != nil
+		if err == nil {
+			for _, event := range events {
+				if err := s.broker.PublishEvent(ctx, event.Event); err != nil {
+					log.Printf("failed to publish outbox event %d: %v", event.ID, err)
+					shouldWait = true
+					break
+				}
+				if err := s.store.MarkEventPublished(ctx, event.ID); err != nil {
+					log.Printf("failed to mark outbox event %d published: %v", event.ID, err)
+					shouldWait = true
+					break
+				}
+			}
+		} else {
+			log.Printf("failed to read event outbox: %v", err)
+		}
+		if shouldWait {
+			if !waitForRetry(ctx) {
+				return
+			}
+		}
+	}
+}
+
+func waitForRetry(ctx context.Context) bool {
+	timer := time.NewTimer(2 * time.Second)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return false
+	case <-timer.C:
+		return true
 	}
 }
 
@@ -619,6 +783,9 @@ func writeStorageError(w http.ResponseWriter, err error) {
 
 	case errors.Is(err, storage.ErrKindNotFound):
 		writeError(w, http.StatusNotFound, err)
+
+	case errors.Is(err, storage.ErrKindInUse):
+		writeError(w, http.StatusConflict, err)
 
 	case errors.Is(err, storage.ErrInvalidResource):
 		writeError(w, http.StatusBadRequest, err)

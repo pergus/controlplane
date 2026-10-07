@@ -115,3 +115,95 @@ func TestLegacyResourceKindsTableMigratesSchemaColumn(t *testing.T) {
 		t.Fatalf("legacy kind schema = %#v, want no schema", kinds[0].Schema)
 	}
 }
+
+func TestResourceMutationsEnqueueOutboxEvents(t *testing.T) {
+	store, err := NewSQLite(filepath.Join(t.TempDir(), "controlplane.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	ctx := context.Background()
+	resource := protocol.Resource{
+		APIVersion: "v1",
+		Kind:       "Example",
+		Metadata: protocol.Metadata{
+			Name:      "sample",
+			Namespace: "default",
+		},
+		Spec: map[string]any{"value": "first"},
+	}
+	created, err := store.Create(ctx, resource)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	created.Spec["value"] = "second"
+	if _, err := store.Update(ctx, created); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Delete(ctx, "v1", "Example", "default", "sample"); err != nil {
+		t.Fatal(err)
+	}
+
+	events, err := store.ListPendingEvents(ctx, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantTypes := []protocol.EventType{protocol.Added, protocol.Modified, protocol.Deleted}
+	if len(events) != len(wantTypes) {
+		t.Fatalf("pending event count = %d, want %d", len(events), len(wantTypes))
+	}
+	for index, wantType := range wantTypes {
+		if events[index].Event.Type != wantType {
+			t.Errorf("event %d type = %q, want %q", index, events[index].Event.Type, wantType)
+		}
+		if events[index].Event.Object.Metadata.ResourceVersion == 0 {
+			t.Errorf("event %d has no resourceVersion", index)
+		}
+	}
+
+	if err := store.MarkEventPublished(ctx, events[0].ID); err != nil {
+		t.Fatal(err)
+	}
+	events, err = store.ListPendingEvents(ctx, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(events) != 2 || events[0].Event.Type != protocol.Modified {
+		t.Fatalf("pending events after marking first = %#v, want modified and deleted", events)
+	}
+}
+
+func TestDeleteKindRequiresNoResources(t *testing.T) {
+	store, err := NewSQLite(filepath.Join(t.TempDir(), "controlplane.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	ctx := context.Background()
+	kind := protocol.ResourceKind{APIVersion: "v1", Kind: "Example", Resource: "examples"}
+	if err := store.RegisterKind(ctx, kind); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Create(ctx, protocol.Resource{
+		APIVersion: "v1",
+		Kind:       "Example",
+		Metadata:   protocol.Metadata{Name: "sample"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.DeleteKind(ctx, "v1", "Example"); err != ErrKindInUse {
+		t.Fatalf("delete kind with resource error = %v, want %v", err, ErrKindInUse)
+	}
+	if _, err := store.Delete(ctx, "v1", "Example", "", "sample"); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.DeleteKind(ctx, "v1", "Example"); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.DeleteKind(ctx, "v1", "Example"); err != ErrKindNotFound {
+		t.Fatalf("delete missing kind error = %v, want %v", err, ErrKindNotFound)
+	}
+}

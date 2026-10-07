@@ -13,8 +13,14 @@ tasks:
     desc: Build all components
     cmds:
       - task: build-api-server
+      - task: build-cpctl
       - task: build-dns-controller
       - task: build-certificate-controller
+
+  build-cpctl:
+    desc: Build the cpctl client
+    cmds:
+      - go build -o {{.BIN_DIR}}/cpctl ./cpctl
 
   build-api-server:
     desc: Build the API server
@@ -32,9 +38,27 @@ tasks:
       - go build -o {{.BIN_DIR}}/certificate-controller ./certificate-controller
 
   run:
-    desc: Run the API server
+    desc: Run NATS with JetStream and the API server
     cmds:
-      - go run ./api-server
+      - |
+        export NATS_ADMIN_PASSWORD="${NATS_ADMIN_PASSWORD:-controlplane-admin-local}"
+        export NATS_APP_USERNAME="${NATS_APP_USERNAME:-application}"
+        export NATS_APP_PASSWORD="${NATS_APP_PASSWORD:-${NATS_PASSWORD:-controlplane-app-local}}"
+        export NATS_USERNAME="${NATS_USERNAME:-$NATS_APP_USERNAME}"
+        export NATS_PASSWORD="${NATS_PASSWORD:-$NATS_APP_PASSWORD}"
+        nats-server -js -c ./nats-server.conf &
+        nats_pid=$!
+        trap 'kill "$nats_pid" 2>/dev/null || true; wait "$nats_pid" 2>/dev/null || true' EXIT
+        go run ./api-server
+
+  run-nats:
+    desc: Run NATS with JetStream enabled
+    cmds:
+      - |
+        export NATS_ADMIN_PASSWORD="${NATS_ADMIN_PASSWORD:-controlplane-admin-local}"
+        export NATS_APP_USERNAME="${NATS_APP_USERNAME:-application}"
+        export NATS_APP_PASSWORD="${NATS_APP_PASSWORD:-${NATS_PASSWORD:-controlplane-app-local}}"
+        nats-server -js -c ./nats-server.conf
 
   run-dns:
     desc: Run the DNS controller
@@ -45,6 +69,11 @@ tasks:
     desc: Run the certificate controller
     cmds:
       - go run ./certificate-controller
+
+  run-cpctl:
+    desc: Run cpctl
+    cmds:
+      - go run ./cpctl {{.CLI_ARGS}}
 
   test:
     desc: Run all tests
