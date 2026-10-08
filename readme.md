@@ -365,9 +365,6 @@ The API server supports dynamic resource-kind registration.
 A resource kind is described by:
 
 The `watchers` map contains active HTTP watch connections. They exist only in API-server memory and close when the server stops. When a resource changes, the server sends the event to matching watchers and records it in the transactional outbox for JetStream delivery.
-    Schema     map[string]any `json:"schema,omitempty"`
-}
-```
 
 `schema` is an optional JSON Schema for the resource's `spec`. The API server compiles the schema when the kind is registered, then validates every create and update before saving the resource or publishing a watch event. If no schema is registered, the API server performs no schema-based validation of `spec`.
 
