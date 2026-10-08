@@ -527,6 +527,18 @@ The current API endpoints are:
 | GET, POST        | `/api/{apiVersion}/{kind}`            | List or create resources           |
 | GET, PUT, DELETE | `/api/{apiVersion}/{kind}/{name}`     | Get, update, or delete resource    |
 
+Append the ?pretty query argument to an endpoint to return the JSON response as a formatted, indented JSON document. 
+
+For example:
+
+    GET /api/kinds?pretty
+
+or:
+
+    curl 'http://localhost:8080/api/kinds?pretty'
+
+Without ?pretty, the endpoint returns the JSON response in its normal compact format.
+
 Run `gubctl api-resources` to list these endpoints along with registered kinds.
 
 `GET /api/namespaces` returns sorted, distinct, non-empty namespace names used by resources. Resources with an empty namespace are cluster-scoped and do not appear in this list.

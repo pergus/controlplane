@@ -230,6 +230,11 @@ func (s *Server) handleKind(w http.ResponseWriter, r *http.Request, apiVersion, 
 		}
 		for _, kind := range kinds {
 			if kind.APIVersion == apiVersion && kind.Kind == kindName {
+				if _, ok := r.URL.Query()["pretty"]; ok {
+					writeJSONPretty(w, http.StatusOK, kind)
+					return
+				}
+
 				writeJSON(w, http.StatusOK, kind)
 				return
 			}
@@ -292,6 +297,11 @@ func (s *Server) handleKinds(w http.ResponseWriter, r *http.Request) {
 			APIVersion: "v1",
 			Kind:       "KindList",
 			Items:      kinds,
+		}
+
+		if _, ok := r.URL.Query()["pretty"]; ok {
+			writeJSONPretty(w, http.StatusOK, result)
+			return
 		}
 
 		writeJSON(w, http.StatusOK, result)
@@ -417,6 +427,11 @@ func (s *Server) handleResources(w http.ResponseWriter, r *http.Request) {
 		"items":      resources,
 	}
 
+	if _, ok := r.URL.Query()["pretty"]; ok {
+		writeJSONPretty(w, http.StatusOK, result)
+		return
+	}
+
 	writeJSON(w, http.StatusOK, result)
 }
 
@@ -436,11 +451,19 @@ func (s *Server) handleNamespaces(w http.ResponseWriter, r *http.Request) {
 	for _, name := range names {
 		namespaces = append(namespaces, protocol.Namespace{Name: name})
 	}
-	writeJSON(w, http.StatusOK, protocol.NamespaceList{
+
+	result := protocol.NamespaceList{
 		APIVersion: "v1",
 		Kind:       "NamespaceList",
 		Items:      namespaces,
-	})
+	}
+
+	if _, ok := r.URL.Query()["pretty"]; ok {
+		writeJSONPretty(w, http.StatusOK, result)
+		return
+	}
+
+	writeJSON(w, http.StatusOK, result)
 }
 
 func (s *Server) handleResourceCollection(w http.ResponseWriter, r *http.Request, apiVersion, kind string) {
@@ -493,7 +516,10 @@ func (s *Server) listResources(w http.ResponseWriter, r *http.Request, apiVersio
 		"kind":       kind + "List",
 		"items":      resources,
 	}
-
+	if _, ok := r.URL.Query()["pretty"]; ok {
+		writeJSONPretty(w, http.StatusOK, result)
+		return
+	}
 	writeJSON(w, http.StatusOK, result)
 }
 
@@ -556,6 +582,10 @@ func (s *Server) getResource(w http.ResponseWriter, r *http.Request, apiVersion,
 		return
 	}
 
+	if _, ok := r.URL.Query()["pretty"]; ok {
+		writeJSONPretty(w, http.StatusOK, resource)
+		return
+	}
 	writeJSON(w, http.StatusOK, resource)
 }
 
@@ -841,6 +871,20 @@ func writeJSON(w http.ResponseWriter, status int, value any) {
 	w.WriteHeader(status)
 
 	_ = json.NewEncoder(w).Encode(value)
+}
+
+func writeJSONPretty(w http.ResponseWriter, status int, value any) {
+	data, err := json.MarshalIndent(value, "", "  ")
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+
+	_, _ = w.Write(data)
+	_, _ = w.Write([]byte("\n"))
 }
 
 func writeError(w http.ResponseWriter, status int, err error) {
