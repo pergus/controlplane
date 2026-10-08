@@ -1,6 +1,6 @@
 # Controlplane
 
-Controlplane is a resource-based control plane written in Go. The API server stores resources and kind definitions, validates resource specifications, and provides a REST API and an HTTP watch endpoint. It also publishes resource events to NATS JetStream. Controllers register kinds through JetStream and consume durable per-kind event streams to reconcile external systems. The `cpctl` command-line client manages resources and kinds through the REST API.
+Controlplane or Gubernator is a resource-based control plane written in Go. The API server stores resources and kind definitions, validates resource specifications, and provides a REST API and an HTTP watch endpoint. It also publishes resource events to NATS JetStream. Controllers register kinds through JetStream and consume durable per-kind event streams to reconcile external systems. The `gubctl` command-line client manages resources and kinds through the REST API.
 
 ---
 
@@ -24,7 +24,7 @@ The system has four main parts: the API server, NATS JetStream, API clients, and
                     |                         |
            +--------v--------+       +--------v--------+
            | API clients,    |       | DNS Controller  |
-           | cpctl, HTTP     |       | Certificate     |
+           | gubctl, HTTP    |       | Certificate     |
            +-----------------+       | Controller      |
                                      +--------+--------+
                                               |
@@ -63,7 +63,7 @@ controlplane/
 │       ├── sqlite.go
 │       └── postregs.go
 │
-├── cpctl/
+├── gubctl/
 │   └── main.go
 │
 ├── dns-controller/
@@ -73,7 +73,7 @@ controlplane/
     └── main.go
 ```
 
-`protocol` defines shared resource and event types, while `messaging` provides NATS JetStream operations. `api-server` serves the REST API and persists state. `cpctl` provides the command-line client, and each controller reconciles its resource kinds with an external system.
+`protocol` defines shared resource and event types, while `messaging` provides NATS JetStream operations. `api-server` serves the REST API and persists state. `gubctl` provides the command-line client, and each controller reconciles its resource kinds with an external system.
 
 ## `protocol`
 
@@ -514,19 +514,26 @@ Keep watcher-map access synchronized. The storage implementation manages transac
 
 The current API endpoints are:
 
-| Method        | Endpoint                                         | Purpose                       |
-| ------------- | ------------------------------------------------ | ----------------------------- |
-| GET           | `/api/v1/kinds`                                  | List registered kinds         |
-| POST          | `/api/v1/kinds`                                  | Register a kind               |
-| GET           | `/api/v1/kinds/{apiVersion}/{kind}`              | Get a kind                    |
-| PUT           | `/api/v1/kinds/{apiVersion}/{kind}`              | Update a kind                 |
-| DELETE        | `/api/v1/kinds/{apiVersion}/{kind}`              | Delete an unused kind         |
-| GET           | `/api/v1/resources`                              | List resources                |
-| GET           | `/api/v1/watch`                                  | Watch resources               |
-| GET, POST     | `/api/{apiVersion}/{kind}`                       | List or create resources      |
-| GET, PUT, DELETE | `/api/{apiVersion}/{kind}/{name}`              | Get, update, or delete resource |
+| Method           | Endpoint                              | Purpose                            |
+| -----------------| --------------------------------------| -----------------------------------|
+| GET              | `/api/kinds`                          | List registered kinds              |
+| POST             | `/api/kinds`                          | Register a kind                    |
+| GET              | `/api/kinds/{apiVersion}/{kind}`      | Get a kind                         |
+| PUT              | `/api/kinds/{apiVersion}/{kind}`      | Update a kind                      |
+| DELETE           | `/api/kinds/{apiVersion}/{kind}`      | Delete an unused kind              |
+| GET              | `/api/resources`                      | List resources                     |
+| GET              | `/api/namespaces`                     | List resource namespaces           |
+| GET, PUT         | `/api/watch`                          | Watch resources or set watch state |
+| GET, POST        | `/api/{apiVersion}/{kind}`            | List or create resources           |
+| GET, PUT, DELETE | `/api/{apiVersion}/{kind}/{name}`     | Get, update, or delete resource    |
 
-Run `cpctl api-resources` to list these endpoints along with registered kinds.
+Run `gubctl api-resources` to list these endpoints along with registered kinds.
+
+`GET /api/namespaces` returns sorted, distinct, non-empty namespace names used by resources. Resources with an empty namespace are cluster-scoped and do not appear in this list.
+
+Use `gubctl get namespaces` to list the namespaces in a table. Use `-o json` or `-o yaml` to select another format.
+
+Send `PUT /api/watch` with `{"enabled": false}` to disable all HTTP watches. The server closes active watch streams and returns HTTP `503 Service Unavailable` to new watch requests. Send `{"enabled": true}` to allow new watches. The setting is held in API-server memory and resets to enabled after a restart. This control affects the HTTP watch endpoint only; JetStream controller delivery continues.
 
 ---
 
@@ -535,7 +542,7 @@ Run `cpctl api-resources` to list these endpoints along with registered kinds.
 Endpoint:
 
 ```
-GET /api/v1/kinds
+GET /api/kinds
 ```
 
 This endpoint returns all registered resource kinds.
@@ -543,7 +550,7 @@ This endpoint returns all registered resource kinds.
 Example:
 
 ```bash
-curl http://localhost:8080/api/v1/kinds
+curl http://localhost:8080/api/kinds
 ```
 
 Example response:
@@ -576,7 +583,7 @@ The response has `apiVersion`, `kind`, and `items` fields. Each item contains on
 Endpoint:
 
 ```
-POST /api/v1/kinds
+POST /api/kinds
 ```
 
 The request body must contain these fields:
@@ -592,10 +599,7 @@ resource
 Example:
 
 ```bash
-curl \
-  -X POST \
-  -H 'Content-Type: application/json' \
-  http://localhost:8080/api/v1/kinds \
+curl -X POST \-H 'Content-Type: application/json http://localhost:8080/api/kinds \
   -d '{
     "apiVersion": "v1",
     "kind": "DNSRecord",
@@ -644,13 +648,13 @@ The kind and schema are stored in the selected database. A controller can regist
 Endpoint:
 
 ```
-GET /api/v1/resources
+GET /api/resources
 ```
 
 Example:
 
 ```bash
-curl http://localhost:8080/api/v1/resources
+curl http://localhost:8080/api/resources
 ```
 
 The response is a list of resources. Use this endpoint to inspect or debug stored state.
@@ -687,13 +691,13 @@ Use the `kind` query argument to return only resources of the selected kind.
 Endpoint:
 
 ```
-GET /api/v1/resources?kind=DNSRecord
+GET /api/resources?kind=DNSRecord
 ```
 
 Example:
 
 ```bash
-curl 'http://localhost:8080/api/v1/resources?kind=DNSRecord'
+curl 'http://localhost:8080/api/resources?kind=DNSRecord'
 ```
 
 ---
@@ -705,7 +709,7 @@ Use the `apiVersion` query argument to return resources with the selected API ve
 Example:
 
 ```bash
-curl 'http://localhost:8080/api/v1/resources?apiVersion=v1'
+curl 'http://localhost:8080/api/resources?apiVersion=v1'
 ```
 
 For example, this request returns resources with:
@@ -723,7 +727,7 @@ Use the `namespace` query argument to return resources in the selected namespace
 Example:
 
 ```bash
-curl 'http://localhost:8080/api/v1/resources?namespace=default'
+curl 'http://localhost:8080/api/resources?namespace=default'
 ```
 
 ---
@@ -735,8 +739,7 @@ You can combine the `apiVersion`, `kind`, and `namespace` filters. The server ap
 Example:
 
 ```bash
-curl \
-  'http://localhost:8080/api/v1/resources?apiVersion=v1&kind=DNSRecord&namespace=default'
+curl 'http://localhost:8080/api/resources?apiVersion=v1&kind=DNSRecord&namespace=default'
 ```
 
 This request selects:
@@ -760,7 +763,7 @@ GET /api/{apiVersion}/{kind}
 Use the collection endpoint to list resources for a kind. For example, these requests list DNS records and certificates:
 
 ```bash
-curl http://localhost:8080/api/v1/DNSRecord
+curl http://localhost:8080/api/DNSRecord
 ```
 
 The server returns a resource list. For example:
@@ -793,8 +796,7 @@ The server returns a resource list. For example:
 Add the `namespace` query argument to list resources in one namespace. For example:
 
 ```bash
-curl \
-  'http://localhost:8080/api/v1/DNSRecord?namespace=default'
+curl 'http://localhost:8080/api/DNSRecord?namespace=default'
 ```
 
 ---
@@ -810,10 +812,7 @@ POST /api/{apiVersion}/{kind}
 Example:
 
 ```bash
-curl \
-  -X POST \
-  -H 'Content-Type: application/json' \
-  http://localhost:8080/api/v1/DNSRecord \
+curl -X POST -H 'Content-Type: application/json' http://localhost:8080/api/DNSRecord \
   -d '{
     "apiVersion": "v1",
     "kind": "DNSRecord",
@@ -847,10 +846,7 @@ If `spec` does not match the registered schema, the API server returns HTTP `400
 Example:
 
 ```bash
-curl \
-  -X POST \
-  -H 'Content-Type: application/json' \
-  http://localhost:8080/api/v1/Certificate \
+curl -X POST -H 'Content-Type: application/json' http://localhost:8080/api/Certificate \
   -d '{
     "apiVersion": "v1",
     "kind": "Certificate",
@@ -880,7 +876,7 @@ GET /api/{apiVersion}/{kind}/{name}
 Example:
 
 ```bash
-curl http://localhost:8080/api/v1/DNSRecord/example
+curl http://localhost:8080/api/DNSRecord/example
 ```
 
 Example response:
@@ -906,8 +902,7 @@ Example response:
 For a namespaced resource, add the `namespace` query argument:
 
 ```bash
-curl \
-  'http://localhost:8080/api/v1/DNSRecord/example?namespace=default'
+curl 'http://localhost:8080/api/DNSRecord/example?namespace=default'
 ```
 
 ---
@@ -923,10 +918,7 @@ PUT /api/{apiVersion}/{kind}/{name}
 Example:
 
 ```bash
-curl \
-  -X PUT \
-  -H 'Content-Type: application/json' \
-  http://localhost:8080/api/v1/DNSRecord/example \
+curl -X PUT -H 'Content-Type: application/json' http://localhost:8080/api/DNSRecord/example \
   -d '{
     "apiVersion": "v1",
     "kind": "DNSRecord",
@@ -968,17 +960,13 @@ DELETE /api/{apiVersion}/{kind}/{name}
 Example:
 
 ```bash
-curl \
-  -X DELETE \
-  http://localhost:8080/api/v1/DNSRecord/example
+curl -X DELETE http://localhost:8080/api/DNSRecord/example
 ```
 
 For a namespaced resource, include the `namespace` query argument:
 
 ```bash
-curl \
-  -X DELETE \
-  'http://localhost:8080/api/v1/DNSRecord/example?namespace=default'
+curl -X DELETE 'http://localhost:8080/api/DNSRecord/example?namespace=default'
 ```
 
 If the resource exists, the server removes it and publishes a `DELETED` event. The controller uses that event to remove the corresponding external state. For example:
@@ -1000,7 +988,7 @@ DNS record removed from DNS server
 The watch API is:
 
 ```
-GET /api/v1/watch
+GET /api/watch
 ```
 
 The connection remains open and streams matching events when resources change.
@@ -1008,7 +996,7 @@ The connection remains open and streams matching events when resources change.
 Example:
 
 ```bash
-curl -N http://localhost:8080/api/v1/watch
+curl -N http://localhost:8080/api/watch
 ```
 
 The `-N` option prevents curl from buffering the response, so events appear as the server sends them.
@@ -1020,8 +1008,7 @@ The `-N` option prevents curl from buffering the response, so events appear as t
 Example:
 
 ```bash
-curl -N \
-  'http://localhost:8080/api/v1/watch?kind=DNSRecord'
+curl -N 'http://localhost:8080/api/watch?kind=DNSRecord'
 ```
 
 This request watches only `DNSRecord` resources.
@@ -1033,8 +1020,7 @@ This request watches only `DNSRecord` resources.
 Example:
 
 ```bash
-curl -N \
-  'http://localhost:8080/api/v1/watch?apiVersion=v1'
+curl -N 'http://localhost:8080/api/watch?apiVersion=v1'
 ```
 
 This request watches resources with API version `v1`.
@@ -1047,7 +1033,7 @@ Example:
 
 ```bash
 curl -N \
-  'http://localhost:8080/api/v1/watch?namespace=default'
+  'http://localhost:8080/api/watch?namespace=default'
 ```
 
 This request watches resources in the `default` namespace.
@@ -1060,7 +1046,7 @@ Example:
 
 ```bash
 curl -N \
-  'http://localhost:8080/api/v1/watch?apiVersion=v1&kind=DNSRecord&namespace=default'
+  'http://localhost:8080/api/watch?apiVersion=v1&kind=DNSRecord&namespace=default'
 ```
 
 This request filters by:
@@ -1131,7 +1117,7 @@ Streams created by earlier versions used hashed names. On upgrade, the API serve
 
 # Initial Watch State
 
-When an HTTP client opens `/api/v1/watch`, the API server sends matching resources as `ADDED` events and then streams new events as NDJSON. This snapshot behavior applies to HTTP clients. Controllers use durable JetStream consumers and do not receive an HTTP snapshot.
+When an HTTP client opens `/api/watch`, the API server sends matching resources as `ADDED` events and then streams new events as NDJSON. This snapshot behavior applies to HTTP clients. Controllers use durable JetStream consumers and do not receive an HTTP snapshot.
 
 For example, assume the API server already contains:
 
@@ -1640,7 +1626,7 @@ task
 
 # Building the Project
 
-Build the API server, `cpctl`, and both controllers:
+Build the API server, `gubctl`, and both controllers:
 
 ```bash
 task build
@@ -1651,7 +1637,7 @@ The binaries are written to `bin/`:
 ```
 bin/
 ├── api-server
-├── cpctl
+├── gubctl
 ├── dns-controller
 ├── certificate-controller
 ```
@@ -1699,37 +1685,38 @@ This is expected.
 Use an API endpoint instead:
 
 ```bash
-curl http://localhost:8080/api/v1/kinds
+curl http://localhost:8080/api/kinds
 ```
 
 ---
 
-# cpctl Client
+# gubctl Client
 
-`cpctl` is the Controlplane command-line client. It follows familiar kubectl-style commands and reads resource and kind definitions from YAML.
+`gubctl` is the Controlplane command-line client. It follows familiar kubectl-style commands and reads resource and kind definitions from YAML.
 
-Build it with `task build-cpctl` to create `bin/cpctl`, or run a one-off command with `task run-cpctl -- get kinds`.
+Build it with `task build-gubctl` to create `bin/gubctl`, or run a one-off command with `task run-gubctl -- get kinds`.
 
 List API endpoints and registered kinds:
 
 ```bash
-cpctl api-resources
-cpctl get kinds
+gubctl api-resources
+gubctl get kinds
+gubctl get namespaces
 ```
 
 List resources, get one resource, or select a namespace:
 
 ```bash
-cpctl get DNSRecord -n default
-cpctl get DNSRecord example -n default -o yaml
+gubctl get DNSRecord -n default
+gubctl get DNSRecord example -n default -o yaml
 ```
 
 Describe a resource or a kind:
 
 ```bash
-cpctl describe DNSRecord example -n default
-cpctl describe DNSRecord/example -n default
-cpctl describe kind DNSRecord
+gubctl describe DNSRecord example -n default
+gubctl describe DNSRecord/example -n default
+gubctl describe kind DNSRecord
 ```
 
 Create or apply a resource definition:
@@ -1746,8 +1733,8 @@ spec:
 ```
 
 ```bash
-cpctl create -f dns-record.yaml
-cpctl apply -f dns-record.yaml
+gubctl create -f dns-record.yaml
+gubctl apply -f dns-record.yaml
 ```
 
 Kind definitions use the same YAML form as the API, including `resource`, `namespaced`, and optional `schema` fields. `apply` creates missing definitions and updates existing ones. `delete kind KIND` removes a kind only after its resources have been deleted.
@@ -1755,19 +1742,19 @@ Kind definitions use the same YAML form as the API, including `resource`, `names
 Delete resources by name or from a YAML file:
 
 ```bash
-cpctl delete DNSRecord example -n default
-cpctl delete -f dns-record.yaml
+gubctl delete DNSRecord example -n default
+gubctl delete -f dns-record.yaml
 ```
 
 Watch all events, a kind, or one resource. `--type` can be repeated or given a comma-separated list:
 
 ```bash
-cpctl watch
-cpctl watch DNSRecord
-cpctl watch DNSRecord/example -n default --type ADDED,MODIFIED
+gubctl watch
+gubctl watch DNSRecord
+gubctl watch DNSRecord/example -n default --type ADDED,MODIFIED
 ```
 
-Use `--server` or `CPCTL_SERVER` to select the API server. Output formats are `table`, `yaml`, and `json`; use `-o yaml` or `-o json`.
+Use `--server` or `gubctl_SERVER` to select the API server. Output formats are `table`, `yaml`, and `json`; use `-o yaml` or `-o json`.
 
 ---
 
@@ -1801,10 +1788,7 @@ registered resource kind v1/DNSRecord
 Start the API server with `task run`, then register a DNS kind if a controller has not already registered it:
 
 ```bash
-curl \
-  -X POST \
-  -H 'Content-Type: application/json' \
-  http://localhost:8080/api/v1/kinds \
+curl -X POST -H 'Content-Type: application/json' http://localhost:8080/api/kinds \
   -d '{
     "apiVersion": "v1",
 ```
@@ -1812,10 +1796,7 @@ curl \
 Create a resource:
 
 ```bash
-curl \
-  -X POST \
-  -H 'Content-Type: application/json' \
-  http://localhost:8080/api/v1/DNSRecord \
+curl -X POST -H 'Content-Type: application/json' http://localhost:8080/api/DNSRecord \
   -d '{
     "apiVersion": "v1",
     "kind": "DNSRecord",
@@ -1842,17 +1823,13 @@ curl \
 Read it:
 
 ```bash
-curl \
-  'http://localhost:8080/api/v1/DNSRecord/example?namespace=default'
+curl 'http://localhost:8080/api/DNSRecord/example?namespace=default'
 ```
 
 Update it:
 
 ```bash
-curl \
-  -X PUT \
-  -H 'Content-Type: application/json' \
-  http://localhost:8080/api/v1/DNSRecord/example \
+curl -X PUT -H 'Content-Type: application/json' http://localhost:8080/api/DNSRecord/example \
   -d '{
     "apiVersion": "v1",
     "kind": "DNSRecord",
@@ -1870,9 +1847,7 @@ curl \
 Delete it:
 
 ```bash
-curl \
-  -X DELETE \
-  'http://localhost:8080/api/v1/DNSRecord/example?namespace=default'
+curl -X DELETE 'http://localhost:8080/api/DNSRecord/example?namespace=default'
 ```
 
 ---
@@ -1903,7 +1878,7 @@ A resource creation stores the resource and an `ADDED` outbox event in one trans
 ```
 curl
  |
- | POST /api/v1/DNSRecord
+ | POST /api/DNSRecord
  v
 API server
  |
@@ -1935,7 +1910,7 @@ The controller receives `ADDED` after the outbox relay publishes the event. JetS
 An update stores the new resource state and a `MODIFIED` outbox event in one transaction. The API server increments `generation` when `spec` changes and increments `resourceVersion` for each update.
 
 ```
-PUT /api/v1/DNSRecord/example
+PUT /api/DNSRecord/example
           |
           v
      API server
@@ -2156,7 +2131,7 @@ Per-kind JetStream streams use file storage and retain messages for seven days. 
 
 # HTTP Watch Behavior
 
-`GET /api/v1/watch` sends the current matching resources as `ADDED` events, then streams new changes as NDJSON. The endpoint stores active connections and watcher state in API-server memory. An API-server restart closes these connections, so HTTP clients must reconnect and receive a new snapshot. Controllers do not use this endpoint; they consume durable JetStream streams.
+`GET /api/watch` sends the current matching resources as `ADDED` events, then streams new changes as NDJSON. The endpoint stores active connections and watcher state in API-server memory. An API-server restart closes these connections, so HTTP clients must reconnect and receive a new snapshot. Controllers do not use this endpoint; they consume durable JetStream streams.
 
 ---
 
@@ -2165,7 +2140,7 @@ Per-kind JetStream streams use file storage and retain messages for seven days. 
 The API server persists state in SQL and publishes resource events to JetStream:
 
 ```
-REST clients and cpctl
+REST clients and gubctl
         |
         | HTTP
         v
@@ -2310,7 +2285,7 @@ Controllers can use the generation to determine whether they have reconciled the
 Resource kinds are persisted. Controllers publish definitions to the JetStream registration stream; the API server validates and stores each definition, creates its event stream, and acknowledges registration. Administrative clients can also register a kind through:
 
 ```
-POST /api/v1/kinds
+POST /api/kinds
 ```
 
 For example:
@@ -2327,7 +2302,7 @@ For example:
 The storage backend keeps kind definitions across API-server restarts. Clients can list registered kinds with:
 
 ```
-GET /api/v1/kinds
+GET /api/kinds
 ```
 
 This lets clients discover available resource types without a hard-coded controller list in the API server.
@@ -2938,7 +2913,7 @@ desired state == actual state
 ## Kind discovery
 
 ```
-GET /api/v1/kinds
+GET /api/kinds
 ```
 
 Returns all registered resource kinds.
@@ -2948,7 +2923,7 @@ Returns all registered resource kinds.
 ## Kind registration
 
 ```
-POST /api/v1/kinds
+POST /api/kinds
 ```
 
 Request body:
@@ -2976,9 +2951,9 @@ Request body:
 Use the kind's API version and name to read, update, or delete a kind:
 
 ```
-GET    /api/v1/kinds/{apiVersion}/{kind}
-PUT    /api/v1/kinds/{apiVersion}/{kind}
-DELETE /api/v1/kinds/{apiVersion}/{kind}
+GET    /api/kinds/{apiVersion}/{kind}
+PUT    /api/kinds/{apiVersion}/{kind}
+DELETE /api/kinds/{apiVersion}/{kind}
 ```
 
 `PUT` uses the same kind definition as registration. `DELETE` returns a conflict if resources still use the kind.
@@ -2988,7 +2963,7 @@ DELETE /api/v1/kinds/{apiVersion}/{kind}
 ## All resources
 
 ```
-GET /api/v1/resources
+GET /api/resources
 ```
 
 Optional query arguments:
@@ -3002,7 +2977,7 @@ namespace
 Example:
 
 ```
-/api/v1/resources?apiVersion=v1&kind=DNSRecord&namespace=default
+/api/resources?apiVersion=v1&kind=DNSRecord&namespace=default
 ```
 
 ---
@@ -3010,7 +2985,7 @@ Example:
 ## All resources watch
 
 ```
-GET /api/v1/watch
+GET /api/watch
 ```
 
 Optional query arguments:
@@ -3024,7 +2999,7 @@ namespace
 Example:
 
 ```
-/api/v1/watch?apiVersion=v1&kind=DNSRecord&namespace=default
+/api/watch?apiVersion=v1&kind=DNSRecord&namespace=default
 ```
 
 ---
@@ -3135,7 +3110,7 @@ DELETE /api/v1/DNSRecord/example?namespace=default
 The current request and event paths are:
 
 ```
-                cpctl and REST clients
+                gubctl and REST clients
                     |
                     | HTTP REST API
                     v
@@ -3173,6 +3148,6 @@ Controlplane stores desired state as resources. The API server provides resource
 
 Controllers register kinds through the registration stream and consume events through durable JetStream consumers. Delivery is at least once, and streams retain events for seven days. Controllers must make reconciliation idempotent and use the API server's current resource state after outages that exceed event retention.
 
-`cpctl` lists endpoints, manages resources and kinds from YAML files, and watches HTTP events. The separate HTTP watch endpoint sends an initial resource snapshot and then NDJSON events. Its active connections are held in API-server memory.
+`gubctl` lists endpoints, manages resources and kinds from YAML files, and watches HTTP events. The separate HTTP watch endpoint sends an initial resource snapshot and then NDJSON events. Its active connections are held in API-server memory.
 
 SQLite is the default storage backend. PostgreSQL is also supported. The NATS configuration uses persistent JetStream storage under `.nats/jetstream` for local runs.

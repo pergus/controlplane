@@ -186,7 +186,7 @@ func TestFindKindRequiresVersionWhenAmbiguous(t *testing.T) {
 
 func TestGetAllResourcesUsesGlobalEndpoint(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
-		if request.URL.Path != "/api/v1/resources" {
+		if request.URL.Path != "/api/resources" {
 			http.NotFound(writer, request)
 			return
 		}
@@ -210,10 +210,32 @@ func TestGetAllResourcesUsesGlobalEndpoint(t *testing.T) {
 	}
 }
 
+func TestGetNamespaces(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		if request.URL.Path != "/api/namespaces" {
+			http.NotFound(writer, request)
+			return
+		}
+		_, _ = writer.Write([]byte(`{"apiVersion":"v1","kind":"NamespaceList","items":[{"name":"default"},{"name":"kube-system"}]}`))
+	}))
+	defer server.Close()
+
+	command := newRootCommand()
+	var output bytes.Buffer
+	command.SetOut(&output)
+	command.SetArgs([]string{"--server", server.URL, "get", "namespaces"})
+	if err := command.Execute(); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(output.String(), "default") || !strings.Contains(output.String(), "kube-system") {
+		t.Fatalf("namespace output = %q", output.String())
+	}
+}
+
 func TestDescribeResourceAndKind(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
 		switch request.URL.Path {
-		case "/api/v1/kinds":
+		case "/api/kinds":
 			_, _ = writer.Write([]byte(`{"items":[{"apiVersion":"v1","kind":"DNSRecord","resource":"dnsrecords","namespaced":true},{"apiVersion":"v1","kind":"Widget","resource":"widgets","namespaced":true}]}`))
 		case "/api/v1/DNSRecord/example":
 			if request.URL.Query().Get("namespace") != "default" {
@@ -221,7 +243,7 @@ func TestDescribeResourceAndKind(t *testing.T) {
 				return
 			}
 			_, _ = writer.Write([]byte(`{"apiVersion":"v1","kind":"DNSRecord","metadata":{"name":"example","namespace":"default","uid":"abc123","generation":2,"resourceVersion":7,"labels":{"owner":"network"}},"spec":{"hostname":"example.test","address":"192.0.2.10"},"status":{"ready":true}}`))
-		case "/api/v1/kinds/v1/Widget":
+		case "/api/kinds/v1/Widget":
 			_, _ = writer.Write([]byte(`{"apiVersion":"v1","kind":"Widget","resource":"widgets","namespaced":true,"schema":{"type":"object"}}`))
 		default:
 			http.NotFound(writer, request)

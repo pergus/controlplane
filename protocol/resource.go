@@ -32,6 +32,16 @@ type ResourceKindList struct {
 	Items      []ResourceKind `json:"items"`
 }
 
+type Namespace struct {
+	Name string `json:"name"`
+}
+
+type NamespaceList struct {
+	APIVersion string      `json:"apiVersion"`
+	Kind       string      `json:"kind"`
+	Items      []Namespace `json:"items"`
+}
+
 type EventType string
 
 const (

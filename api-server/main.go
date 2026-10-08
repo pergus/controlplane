@@ -33,18 +33,22 @@ type Watcher struct {
 	kind       string
 	namespace  string
 
-	events chan protocol.WatchEvent
-	done   <-chan struct{}
+	events      chan protocol.WatchEvent
+	done        chan struct{}
+	requestDone <-chan struct{}
 }
 
 type Server struct {
 	store  storage.ResourceStore
 	broker *messaging.Client
 
-	mu       sync.Mutex
-	watchID  uint64
-	watchers map[uint64]*Watcher
+	mu           sync.Mutex
+	watchID      uint64
+	watchers     map[uint64]*Watcher
+	watchEnabled bool
 }
+
+var errWatchDisabled = errors.New("HTTP watch is disabled")
 
 func NewServer(store storage.ResourceStore) *Server {
 	return NewServerWithBroker(store, nil)
@@ -52,9 +56,10 @@ func NewServer(store storage.ResourceStore) *Server {
 
 func NewServerWithBroker(store storage.ResourceStore, broker *messaging.Client) *Server {
 	return &Server{
-		store:    store,
-		broker:   broker,
-		watchers: make(map[uint64]*Watcher),
+		store:        store,
+		broker:       broker,
+		watchers:     make(map[uint64]*Watcher),
+		watchEnabled: true,
 	}
 }
 
@@ -160,23 +165,27 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	path := strings.Trim(r.URL.Path, "/")
 
 	switch path {
-	case "api/v1/kinds":
+	case "api/kinds":
 		s.handleKinds(w, r)
 		return
 
-	case "api/v1/resources":
+	case "api/resources":
 		s.handleResources(w, r)
 		return
 
-	case "api/v1/watch":
+	case "api/namespaces":
+		s.handleNamespaces(w, r)
+		return
+
+	case "api/watch":
 		s.handleWatch(w, r)
 		return
 	}
 
-	if strings.HasPrefix(path, "api/v1/kinds/") {
+	if strings.HasPrefix(path, "api/kinds/") {
 		parts := strings.Split(path, "/")
-		if len(parts) == 5 {
-			s.handleKind(w, r, parts[3], parts[4])
+		if len(parts) == 4 {
+			s.handleKind(w, r, parts[2], parts[3])
 			return
 		}
 		http.NotFound(w, r)
@@ -411,6 +420,29 @@ func (s *Server) handleResources(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, result)
 }
 
+func (s *Server) handleNamespaces(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		w.Header().Set("Allow", "GET")
+		http.Error(w, "method not supported", http.StatusMethodNotAllowed)
+		return
+	}
+
+	names, err := s.store.ListNamespaces(r.Context())
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	namespaces := make([]protocol.Namespace, 0, len(names))
+	for _, name := range names {
+		namespaces = append(namespaces, protocol.Namespace{Name: name})
+	}
+	writeJSON(w, http.StatusOK, protocol.NamespaceList{
+		APIVersion: "v1",
+		Kind:       "NamespaceList",
+		Items:      namespaces,
+	})
+}
+
 func (s *Server) handleResourceCollection(w http.ResponseWriter, r *http.Request, apiVersion, kind string) {
 	switch r.Method {
 	case http.MethodGet:
@@ -628,7 +660,24 @@ func validateResourceSpec(definition, spec map[string]any) error {
 }
 
 func (s *Server) handleWatch(w http.ResponseWriter, r *http.Request) {
+	if r.Method == http.MethodPut {
+		var request struct {
+			Enabled *bool `json:"enabled"`
+		}
+		if err := decodeJSON(r, &request); err != nil {
+			writeError(w, http.StatusBadRequest, fmt.Errorf("invalid JSON: %w", err))
+			return
+		}
+		if request.Enabled == nil {
+			writeError(w, http.StatusBadRequest, errors.New("enabled is required"))
+			return
+		}
+		s.setWatchEnabled(*request.Enabled)
+		writeJSON(w, http.StatusOK, map[string]bool{"enabled": *request.Enabled})
+		return
+	}
 	if r.Method != http.MethodGet {
+		w.Header().Set("Allow", "GET, PUT")
 		http.Error(w, "method not supported", http.StatusMethodNotAllowed)
 		return
 	}
@@ -650,6 +699,10 @@ func (s *Server) handleWatch(w http.ResponseWriter, r *http.Request) {
 	watcher, snapshot, err := s.addWatcher(r.Context(), apiVersion, kind, namespace)
 
 	if err != nil {
+		if errors.Is(err, errWatchDisabled) {
+			writeError(w, http.StatusServiceUnavailable, err)
+			return
+		}
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
@@ -677,6 +730,9 @@ func (s *Server) handleWatch(w http.ResponseWriter, r *http.Request) {
 		case <-watcher.done:
 			return
 
+		case <-watcher.requestDone:
+			return
+
 		case event := <-watcher.events:
 			if err := encoder.Encode(event); err != nil {
 				return
@@ -693,16 +749,20 @@ func (s *Server) addWatcher(
 ) (*Watcher, []protocol.Resource, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if !s.watchEnabled {
+		return nil, nil, errWatchDisabled
+	}
 
 	s.watchID++
 
 	watcher := &Watcher{
-		id:         s.watchID,
-		apiVersion: apiVersion,
-		kind:       kind,
-		namespace:  namespace,
-		events:     make(chan protocol.WatchEvent, 64),
-		done:       ctx.Done(),
+		id:          s.watchID,
+		apiVersion:  apiVersion,
+		kind:        kind,
+		namespace:   namespace,
+		events:      make(chan protocol.WatchEvent, 64),
+		done:        make(chan struct{}),
+		requestDone: ctx.Done(),
 	}
 
 	s.watchers[watcher.id] = watcher
@@ -719,6 +779,20 @@ func (s *Server) addWatcher(
 	}
 
 	return watcher, snapshot, nil
+}
+
+func (s *Server) setWatchEnabled(enabled bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.watchEnabled == enabled {
+		return
+	}
+	s.watchEnabled = enabled
+	if !enabled {
+		for _, watcher := range s.watchers {
+			close(watcher.done)
+		}
+	}
 }
 
 func (s *Server) removeWatcher(id uint64) {

@@ -13,14 +13,14 @@ tasks:
     desc: Build all components
     cmds:
       - task: build-api-server
-      - task: build-cpctl
+      - task: build-gubctl
       - task: build-dns-controller
       - task: build-certificate-controller
 
-  build-cpctl:
-    desc: Build the cpctl client
+  build-gubctl:
+    desc: Build the gubctl client
     cmds:
-      - go build -o {{.BIN_DIR}}/cpctl ./cpctl
+      - go build -o {{.BIN_DIR}}/gubctl ./gubctl
 
   build-api-server:
     desc: Build the API server
@@ -70,10 +70,10 @@ tasks:
     cmds:
       - go run ./certificate-controller
 
-  run-cpctl:
-    desc: Run cpctl
+  run-gubctl:
+    desc: Run gubctl
     cmds:
-      - go run ./cpctl {{.CLI_ARGS}}
+      - go run ./gubctl {{.CLI_ARGS}}
 
   test:
     desc: Run all tests

@@ -365,6 +365,29 @@ func (s *SQLiteStore) List(ctx context.Context, filter ResourceFilter) ([]protoc
 	return resources, nil
 }
 
+func (s *SQLiteStore) ListNamespaces(ctx context.Context) ([]string, error) {
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT DISTINCT namespace
+		FROM resources
+		WHERE namespace <> ''
+		ORDER BY namespace
+		`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var namespaces []string
+	for rows.Next() {
+		var namespace string
+		if err := rows.Scan(&namespace); err != nil {
+			return nil, err
+		}
+		namespaces = append(namespaces, namespace)
+	}
+	return namespaces, rows.Err()
+}
+
 func (s *SQLiteStore) Update(ctx context.Context, resource protocol.Resource) (protocol.Resource, error) {
 	spec, err := json.Marshal(resource.Spec)
 	if err != nil {

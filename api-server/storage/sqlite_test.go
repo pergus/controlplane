@@ -207,3 +207,38 @@ func TestDeleteKindRequiresNoResources(t *testing.T) {
 		t.Fatalf("delete missing kind error = %v, want %v", err, ErrKindNotFound)
 	}
 }
+
+func TestListNamespacesReturnsDistinctNonEmptyNames(t *testing.T) {
+	store, err := NewSQLite(filepath.Join(t.TempDir(), "controlplane.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	ctx := context.Background()
+	resources := []protocol.Resource{
+		{APIVersion: "v1", Kind: "Example", Metadata: protocol.Metadata{Name: "one", Namespace: "default"}},
+		{APIVersion: "v1", Kind: "Example", Metadata: protocol.Metadata{Name: "two", Namespace: "default"}},
+		{APIVersion: "v1", Kind: "Example", Metadata: protocol.Metadata{Name: "system", Namespace: "kube-system"}},
+		{APIVersion: "v1", Kind: "Example", Metadata: protocol.Metadata{Name: "cluster-scoped"}},
+	}
+	for _, resource := range resources {
+		if _, err := store.Create(ctx, resource); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	namespaces, err := store.ListNamespaces(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"default", "kube-system"}
+	if len(namespaces) != len(want) {
+		t.Fatalf("namespaces = %#v, want %#v", namespaces, want)
+	}
+	for index := range want {
+		if namespaces[index] != want[index] {
+			t.Fatalf("namespaces = %#v, want %#v", namespaces, want)
+		}
+	}
+}

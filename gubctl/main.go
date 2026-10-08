@@ -69,7 +69,7 @@ func main() {
 func newRootCommand() *cobra.Command {
 	options := &cliOptions{server: defaultAPIURL(), output: "table"}
 	root := &cobra.Command{
-		Use:           "cpctl",
+		Use:           "gubctl",
 		Short:         "Controlplane command-line client",
 		SilenceUsage:  true,
 		SilenceErrors: true,
@@ -97,16 +97,16 @@ func newRootCommand() *cobra.Command {
 	root.AddCommand(newWatchCommand(options))
 	root.AddCommand(&cobra.Command{
 		Use:   "version",
-		Short: "Print cpctl version",
+		Short: "Print gubctl version",
 		Run: func(command *cobra.Command, _ []string) {
-			command.Println("cpctl dev")
+			command.Println("gubctl dev")
 		},
 	})
 	return root
 }
 
 func defaultAPIURL() string {
-	for _, name := range []string{"CPCTL_SERVER", "API_SERVER_URL"} {
+	for _, name := range []string{"gubctl_SERVER", "API_SERVER_URL"} {
 		if value := os.Getenv(name); value != "" {
 			return value
 		}
@@ -186,8 +186,25 @@ func newGetCommand(options *cliOptions) *cobra.Command {
 		Args:  cobra.RangeArgs(1, 2),
 		RunE: func(command *cobra.Command, args []string) error {
 			client := newAPIClient(options.server)
+			if strings.EqualFold(args[0], "namespace") || strings.EqualFold(args[0], "namespaces") {
+				if len(args) != 1 {
+					return errors.New("usage: gubctl get namespaces")
+				}
+				body, status, err := client.request(command.Context(), http.MethodGet, "/api/namespaces", nil)
+				if err != nil {
+					return err
+				}
+				if status < 200 || status >= 300 {
+					return responseError(status, body)
+				}
+				var namespaces protocol.NamespaceList
+				if err := json.Unmarshal(body, &namespaces); err != nil {
+					return err
+				}
+				return printNamespaces(command, options.output, namespaces.Items)
+			}
 			if strings.EqualFold(args[0], "all") || strings.EqualFold(args[0], "resources") {
-				endpoint := "/api/v1/resources"
+				endpoint := "/api/resources"
 				if options.namespace != "" && !options.allNamespaces {
 					endpoint += namespaceQuery(options.namespace)
 				}
@@ -275,7 +292,7 @@ func newDescribeCommand(options *cliOptions) *cobra.Command {
 			client := newAPIClient(options.server)
 			if strings.EqualFold(args[0], "kind") || strings.EqualFold(args[0], "kinds") {
 				if len(args) != 2 {
-					return errors.New("usage: cpctl describe kind KIND")
+					return errors.New("usage: gubctl describe kind KIND")
 				}
 				kind, err := client.resolveKind(command.Context(), args[1], options.apiVersion)
 				if err != nil {
@@ -306,7 +323,7 @@ func newDescribeCommand(options *cliOptions) *cobra.Command {
 				resourceName = args[1]
 			}
 			if resourceName == "" {
-				return errors.New("a resource name is required; use cpctl get to list resources")
+				return errors.New("a resource name is required; use gubctl get to list resources")
 			}
 
 			kind, err := client.resolveKind(command.Context(), kindName, options.apiVersion)
@@ -428,7 +445,7 @@ func newDeleteCommand(options *cliOptions) *cobra.Command {
 			}
 			if args[0] == "kind" || args[0] == "kinds" {
 				if len(args) != 2 {
-					return errors.New("usage: cpctl delete kind KIND")
+					return errors.New("usage: gubctl delete kind KIND")
 				}
 				kind, err := client.resolveKind(command.Context(), args[1], options.apiVersion)
 				if err != nil {
@@ -503,7 +520,7 @@ func newWatchCommand(options *cliOptions) *cobra.Command {
 			if options.namespace != "" && !options.allNamespaces {
 				query.Set("namespace", options.namespace)
 			}
-			endpoint := "/api/v1/watch"
+			endpoint := "/api/watch"
 			if encoded := query.Encode(); encoded != "" {
 				endpoint += "?" + encoded
 			}
@@ -533,7 +550,7 @@ func newWatchCommand(options *cliOptions) *cobra.Command {
 }
 
 func (client *apiClient) listKinds(ctx context.Context) ([]protocol.ResourceKind, error) {
-	body, status, err := client.request(ctx, http.MethodGet, "/api/v1/kinds", nil)
+	body, status, err := client.request(ctx, http.MethodGet, "/api/kinds", nil)
 	if err != nil {
 		return nil, err
 	}
@@ -572,7 +589,7 @@ func (client *apiClient) resolveKind(ctx context.Context, value, apiVersion stri
 
 func (client *apiClient) createDefinition(ctx context.Context, definition manifest) (any, error) {
 	if definition.kind != nil {
-		body, status, err := client.requestJSON(ctx, http.MethodPost, "/api/v1/kinds", definition.kind)
+		body, status, err := client.requestJSON(ctx, http.MethodPost, "/api/kinds", definition.kind)
 		return decodeResponse(body, status, err)
 	}
 	resource := definition.resource
@@ -591,7 +608,7 @@ func (client *apiClient) applyDefinition(ctx context.Context, definition manifes
 		method := http.MethodPut
 		if status == http.StatusNotFound {
 			method = http.MethodPost
-			endpoint = "/api/v1/kinds"
+			endpoint = "/api/kinds"
 		} else if status < 200 || status >= 300 {
 			return nil, fmt.Errorf("get kind: %s", http.StatusText(status))
 		}
@@ -712,10 +729,11 @@ func readManifests(filename string) ([]manifest, error) {
 
 func printAPIResources(command *cobra.Command, output string, kinds []protocol.ResourceKind) error {
 	resources := []apiResource{
-		{Name: "kinds", APIVersion: "v1", Kind: "ResourceKind", Methods: "GET,POST", Path: "/api/v1/kinds"},
-		{Name: "kind detail", APIVersion: "v1", Kind: "ResourceKind", Methods: "GET,PUT,DELETE", Path: "/api/v1/kinds/{apiVersion}/{kind}"},
-		{Name: "resources", APIVersion: "v1", Kind: "ResourceList", Methods: "GET", Path: "/api/v1/resources"},
-		{Name: "watch", APIVersion: "v1", Kind: "WatchEvent", Methods: "GET", Path: "/api/v1/watch"},
+		{Name: "kinds", APIVersion: "v1", Kind: "ResourceKind", Methods: "GET,POST", Path: "/api/kinds"},
+		{Name: "kind detail", APIVersion: "v1", Kind: "ResourceKind", Methods: "GET,PUT,DELETE", Path: "/api/kinds/{apiVersion}/{kind}"},
+		{Name: "resources", APIVersion: "v1", Kind: "ResourceList", Methods: "GET", Path: "/api/resources"},
+		{Name: "namespaces", APIVersion: "v1", Kind: "NamespaceList", Methods: "GET", Path: "/api/namespaces"},
+		{Name: "watch", APIVersion: "v1", Kind: "WatchEvent", Methods: "GET,PUT", Path: "/api/watch"},
 	}
 	for _, kind := range kinds {
 		resources = append(resources,
@@ -754,6 +772,18 @@ func printKinds(command *cobra.Command, output string, kinds []protocol.Resource
 	fmt.Fprintln(writer, "KIND\tAPIVERSION\tRESOURCE\tNAMESPACED")
 	for _, kind := range kinds {
 		fmt.Fprintf(writer, "%s\t%s\t%s\t%t\n", kind.Kind, kind.APIVersion, kind.Resource, kind.Namespaced)
+	}
+	return writer.Flush()
+}
+
+func printNamespaces(command *cobra.Command, output string, namespaces []protocol.Namespace) error {
+	if output != "table" {
+		return printValue(command, output, namespaces)
+	}
+	writer := tabwriter.NewWriter(command.OutOrStdout(), 0, 4, 2, ' ', 0)
+	fmt.Fprintln(writer, "NAME")
+	for _, namespace := range namespaces {
+		fmt.Fprintln(writer, namespace.Name)
 	}
 	return writer.Flush()
 }
@@ -954,7 +984,7 @@ func isKindCollection(value string) bool {
 }
 
 func kindPath(kind protocol.ResourceKind) string {
-	return "/api/v1/kinds/" + url.PathEscape(kind.APIVersion) + "/" + url.PathEscape(kind.Kind)
+	return "/api/kinds/" + url.PathEscape(kind.APIVersion) + "/" + url.PathEscape(kind.Kind)
 }
 
 func resourceCollectionPath(kind protocol.ResourceKind) string {

@@ -35,6 +35,8 @@ type ResourceStore interface {
 
 	List(ctx context.Context, filter ResourceFilter) ([]protocol.Resource, error)
 
+	ListNamespaces(ctx context.Context) ([]string, error)
+
 	Update(ctx context.Context, resource protocol.Resource) (protocol.Resource, error)
 
 	Delete(ctx context.Context, apiVersion, kind, namespace, name string) (protocol.Resource, error)
