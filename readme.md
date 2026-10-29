@@ -8,31 +8,10 @@ Controlplane or Gubernator is a resource-based control plane written in Go. The 
 
 The system has four main parts: the API server, NATS JetStream, API clients, and controllers.
 
-```
-                      +----------------------+
-                      |      API Server      |
-                      |                      |
-                      | Resource Store       |
-                      | Kind Registry        |
-                      | REST API             |
-                      | Watch API            |
-                      +----------+-----------+
-                                 |
-                    +------------+------------+
-                    |                         |
-                    | REST API                | NATS JetStream
-                    |                         |
-           +--------v--------+       +--------v--------+
-           | API clients,    |       | DNS Controller  |
-           | gubctl, HTTP    |       | Certificate     |
-           +-----------------+       | Controller      |
-                                     +--------+--------+
-                                              |
-                                    +---------+---------+
-                                    |                   |
-                                    v                   v
-                                  DNS system         PKI / ACME
-```
+
+
+<img src="./doc/images/api-server-architecture.png" alt="API Server Architecture" width="40%">
+
 
 The API server stores desired state and remains independent of controller-specific logic. Controllers register the kinds they manage, consume their event streams, and reconcile external systems. They do not call one another directly.
 
@@ -95,15 +74,12 @@ Keep the protocol package small and independent of DNS, certificates, and contro
 
 The dependency direction is:
 
-```
-protocol
-   ^
-   |
-   +-- api-server
-   |
-   +-- dns-controller
-   |
-   +-- certificate-controller
+```mermaid
+flowchart BT
+    P["protocol"]
+    P --> A["api-server"]
+    P --> D["dns-controller"]
+    P --> C["certificate-controller"]
 ```
 
 This dependency direction lets the API server and controllers use the same protocol without depending on each other's implementation.
@@ -198,10 +174,15 @@ Example:
 
 The complete metadata structure is:
 
-The `resource_kinds` table stores registered kind definitions and their optional `spec` schemas. For example:
-    ResourceVersion uint64            `json:"resourceVersion,omitempty"`
-    Labels          map[string]string `json:"labels,omitempty"`
-    Annotations     map[string]string `json:"annotations,omitempty"`
+```go
+type Metadata struct {
+  Name            string            `json:"name"`
+  Namespace       string            `json:"namespace,omitempty"`
+  UID             string            `json:"uid,omitempty"`
+  Generation      uint64            `json:"generation,omitempty"`
+  ResourceVersion uint64            `json:"resourceVersion,omitempty"`
+  Labels          map[string]string `json:"labels,omitempty"`
+  Annotations     map[string]string `json:"annotations,omitempty"`
 }
 ```
 
@@ -364,7 +345,17 @@ The API server supports dynamic resource-kind registration.
 
 A resource kind is described by:
 
-The `watchers` map contains active HTTP watch connections. They exist only in API-server memory and close when the server stops. When a resource changes, the server sends the event to matching watchers and records it in the transactional outbox for JetStream delivery.
+```go
+type ResourceKind struct {
+  APIVersion string         `json:"apiVersion"`
+  Kind       string         `json:"kind"`
+  Resource   string         `json:"resource"`
+  Namespaced bool           `json:"namespaced"`
+  Schema     map[string]any `json:"schema,omitempty"`
+}
+```
+
+`resource` is the plural name used in resource URLs, and `namespaced` controls whether resources of the kind are namespaced or cluster-scoped.
 
 `schema` is an optional JSON Schema for the resource's `spec`. The API server compiles the schema when the kind is registered, then validates every create and update before saving the resource or publishing a watch event. If no schema is registered, the API server performs no schema-based validation of `spec`.
 
@@ -611,7 +602,7 @@ resource
 Example:
 
 ```bash
-curl -X POST \-H 'Content-Type: application/json http://localhost:8080/api/kinds \
+curl -X POST -H 'Content-Type: application/json' http://localhost:8080/api/kinds \
   -d '{
     "apiVersion": "v1",
     "kind": "DNSRecord",
@@ -772,10 +763,10 @@ Endpoint:
 GET /api/{apiVersion}/{kind}
 ```
 
-Use the collection endpoint to list resources for a kind. For example, these requests list DNS records and certificates:
+Use the collection endpoint to list resources for a kind. For example, this request lists DNS records:
 
 ```bash
-curl http://localhost:8080/api/DNSRecord
+curl http://localhost:8080/api/v1/DNSRecord
 ```
 
 The server returns a resource list. For example:
@@ -808,7 +799,7 @@ The server returns a resource list. For example:
 Add the `namespace` query argument to list resources in one namespace. For example:
 
 ```bash
-curl 'http://localhost:8080/api/DNSRecord?namespace=default'
+curl 'http://localhost:8080/api/v1/DNSRecord?namespace=default'
 ```
 
 ---
@@ -824,7 +815,7 @@ POST /api/{apiVersion}/{kind}
 Example:
 
 ```bash
-curl -X POST -H 'Content-Type: application/json' http://localhost:8080/api/DNSRecord \
+curl -X POST -H 'Content-Type: application/json' http://localhost:8080/api/v1/DNSRecord \
   -d '{
     "apiVersion": "v1",
     "kind": "DNSRecord",
@@ -858,7 +849,7 @@ If `spec` does not match the registered schema, the API server returns HTTP `400
 Example:
 
 ```bash
-curl -X POST -H 'Content-Type: application/json' http://localhost:8080/api/Certificate \
+curl -X POST -H 'Content-Type: application/json' http://localhost:8080/api/v1/Certificate \
   -d '{
     "apiVersion": "v1",
     "kind": "Certificate",
@@ -888,7 +879,7 @@ GET /api/{apiVersion}/{kind}/{name}
 Example:
 
 ```bash
-curl http://localhost:8080/api/DNSRecord/example
+curl http://localhost:8080/api/v1/DNSRecord/example
 ```
 
 Example response:
@@ -914,7 +905,7 @@ Example response:
 For a namespaced resource, add the `namespace` query argument:
 
 ```bash
-curl 'http://localhost:8080/api/DNSRecord/example?namespace=default'
+curl 'http://localhost:8080/api/v1/DNSRecord/example?namespace=default'
 ```
 
 ---
@@ -930,7 +921,7 @@ PUT /api/{apiVersion}/{kind}/{name}
 Example:
 
 ```bash
-curl -X PUT -H 'Content-Type: application/json' http://localhost:8080/api/DNSRecord/example \
+curl -X PUT -H 'Content-Type: application/json' http://localhost:8080/api/v1/DNSRecord/example \
   -d '{
     "apiVersion": "v1",
     "kind": "DNSRecord",
@@ -949,12 +940,9 @@ If the resource exists and `spec` passes schema validation, the server updates i
 
 For example:
 
-```
-generation 1
-       |
-       | spec changed
-       v
-generation 2
+```mermaid
+flowchart TD
+    A["generation 1"] -->|"spec changed"| B["generation 2"]
 ```
 
 The update also changes the resource version and publishes a `MODIFIED` event.
@@ -972,25 +960,21 @@ DELETE /api/{apiVersion}/{kind}/{name}
 Example:
 
 ```bash
-curl -X DELETE http://localhost:8080/api/DNSRecord/example
+curl -X DELETE http://localhost:8080/api/v1/DNSRecord/example
 ```
 
 For a namespaced resource, include the `namespace` query argument:
 
 ```bash
-curl -X DELETE 'http://localhost:8080/api/DNSRecord/example?namespace=default'
+curl -X DELETE 'http://localhost:8080/api/v1/DNSRecord/example?namespace=default'
 ```
 
 If the resource exists, the server removes it and publishes a `DELETED` event. The controller uses that event to remove the corresponding external state. For example:
 
-```
-DNSRecord deleted
-       |
-       v
-DNS controller receives DELETED
-       |
-       v
-DNS record removed from DNS server
+```mermaid
+flowchart TD
+    A["DNSRecord deleted"] --> B["DNS controller receives DELETED"]
+    B --> C["DNS record removed from DNS server"]
 ```
 
 ---
@@ -1044,8 +1028,7 @@ This request watches resources with API version `v1`.
 Example:
 
 ```bash
-curl -N \
-  'http://localhost:8080/api/watch?namespace=default'
+curl -N 'http://localhost:8080/api/watch?namespace=default'
 ```
 
 This request watches resources in the `default` namespace.
@@ -1057,8 +1040,7 @@ This request watches resources in the `default` namespace.
 Example:
 
 ```bash
-curl -N \
-  'http://localhost:8080/api/watch?apiVersion=v1&kind=DNSRecord&namespace=default'
+curl -N 'http://localhost:8080/api/watch?apiVersion=v1&kind=DNSRecord&namespace=default'
 ```
 
 This request filters by:
@@ -1179,27 +1161,19 @@ Controllers recover through their durable JetStream consumer position, not throu
 
 A controller is a separate Go program. It registers its resource kind through the registration stream, then consumes events from the kind's durable JetStream stream. It reconciles each event with the external system that it manages.
 
-```
-Register kind and consume events
-      |
-      v
-Receive event
-      |
-      v
-Reconcile desired state
-      |
-      v
-Change external system
+```mermaid
+flowchart TD
+    A["Register kind and consume events"] --> B["Receive event"]
+    B --> C["Reconcile desired state"]
+    C --> D["Change external system"]
 ```
 
 Controllers must not depend on one another being online. For example:
 
-```
-DNS controller
-    |
-    +-- API server
-    |
-    +-- DNS system
+```mermaid
+flowchart TD
+    A["DNS controller"] --> B["API server"]
+    A --> C["DNS system"]
 ```
 
 The DNS controller does not call the certificate controller, and the certificate controller does not call the DNS controller. If controllers need to exchange information, they should use resources.
@@ -1375,7 +1349,7 @@ DHCPReservation
 Choose its resource name:
 
 ```
-dhcReservations
+dhcpReservations
 ```
 
 A clearer resource name would normally be:
@@ -1524,9 +1498,7 @@ Then implement the desired-state logic.
 For example:
 
 ```go
-func reconcileDHCPReservation(
-    resource protocol.Resource,
-) error {
+func reconcileDHCPReservation(resource protocol.Resource) error {
     macAddress, _ := resource.Spec["macAddress"].(string)
     address, _ := resource.Spec["address"].(string)
     hostname, _ := resource.Spec["hostname"].(string)
@@ -1568,9 +1540,7 @@ This gives the controller the information that it needs to remove external state
 Example:
 
 ```go
-func removeDHCPReservation(
-    resource protocol.Resource,
-) error {
+func removeDHCPReservation(resource protocol.Resource) error {
     macAddress, _ := resource.Spec["macAddress"].(string)
 
     log.Printf(
@@ -1803,12 +1773,16 @@ Start the API server with `task run`, then register a DNS kind if a controller h
 curl -X POST -H 'Content-Type: application/json' http://localhost:8080/api/kinds \
   -d '{
     "apiVersion": "v1",
+    "kind": "DNSRecord",
+    "resource": "dnsrecords",
+    "namespaced": true
+  }'
 ```
 
 Create a resource:
 
 ```bash
-curl -X POST -H 'Content-Type: application/json' http://localhost:8080/api/DNSRecord \
+curl -X POST -H 'Content-Type: application/json' http://localhost:8080/api/v1/DNSRecord \
   -d '{
     "apiVersion": "v1",
     "kind": "DNSRecord",
@@ -1822,26 +1796,17 @@ curl -X POST -H 'Content-Type: application/json' http://localhost:8080/api/DNSRe
     }
   }'
 ```
-    ```bash
-    task run-nats
-    ```
-
-    Then run the API server in another terminal:
-
-    ```bash
-    task run
-    ```
 
 Read it:
 
 ```bash
-curl 'http://localhost:8080/api/DNSRecord/example?namespace=default'
+curl 'http://localhost:8080/api/v1/DNSRecord/example?namespace=default'
 ```
 
 Update it:
 
 ```bash
-curl -X PUT -H 'Content-Type: application/json' http://localhost:8080/api/DNSRecord/example \
+curl -X PUT -H 'Content-Type: application/json' http://localhost:8080/api/v1/DNSRecord/example \
   -d '{
     "apiVersion": "v1",
     "kind": "DNSRecord",
@@ -1859,7 +1824,7 @@ curl -X PUT -H 'Content-Type: application/json' http://localhost:8080/api/DNSRec
 Delete it:
 
 ```bash
-curl -X DELETE 'http://localhost:8080/api/DNSRecord/example?namespace=default'
+curl -X DELETE 'http://localhost:8080/api/v1/DNSRecord/example?namespace=default'
 ```
 
 ---
@@ -1887,30 +1852,21 @@ Creating a resource with a name that already exists returns HTTP `409 Conflict`.
 
 A resource creation stores the resource and an `ADDED` outbox event in one transaction. The API server responds after the transaction commits; a background worker then publishes the event to JetStream.
 
-```
-curl
- |
- | POST /api/DNSRecord
- v
-API server
- |
- v
-HTTP handler
- |
- v
-JSON decoder
- |
- v
-Store.Create()
- |
-+-- generate UID and resourceVersion
-+-- store resource and outbox event
- |
- +--> HTTP response
- |
- +--> HTTP watcher broadcast
- |
- +--> Outbox relay --> JetStream --> durable controller consumer
+```mermaid
+flowchart TD
+    A["curl"] -->|"POST /api/v1/DNSRecord"| B["API server"]
+    B --> C["HTTP handler"]
+    C --> D["JSON decoder"]
+    D --> E["Store.Create()"]
+
+    E --> F["Generate UID and resourceVersion"]
+    F --> G["Store resource and outbox event"]
+
+    G --> H["HTTP response"]
+    G --> I["HTTP watcher broadcast"]
+    G --> J["Outbox relay"]
+    J --> K["JetStream"]
+    K --> L["Durable controller consumer"]
 ```
 
 The controller receives `ADDED` after the outbox relay publishes the event. JetStream confirms the publish before the relay removes the outbox row.
@@ -1922,7 +1878,7 @@ The controller receives `ADDED` after the outbox relay publishes the event. JetS
 An update stores the new resource state and a `MODIFIED` outbox event in one transaction. The API server increments `generation` when `spec` changes and increments `resourceVersion` for each update.
 
 ```
-PUT /api/DNSRecord/example
+PUT /api/v1/DNSRecord/example
           |
           v
      API server
