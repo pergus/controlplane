@@ -1,6 +1,12 @@
 # Controlplane
 
-Controlplane or Gubernator is a resource-based control plane written in Go. The API server stores resources and kind definitions, validates resource specifications, and provides a REST API and an HTTP watch endpoint. It also publishes resource events to NATS JetStream. Controllers register kinds through JetStream and consume durable per-kind event streams to reconcile external systems. The `gubctl` command-line client manages resources and kinds through the REST API.
+Controlplane or Gubernator is a resource-based control plane written in Go. The
+API server stores resources and kind definitions, validates resource
+specifications, and provides a REST API and an HTTP watch endpoint. It also
+publishes resource events to NATS JetStream. Controllers register kinds through
+JetStream and consume durable per-kind event streams to reconcile external
+systems. The `gubctl` command-line client manages resources and kinds through
+the REST API.
 
 ---
 
@@ -13,7 +19,10 @@ The system has four main parts: the API server, NATS JetStream, API clients, and
 <img src="./doc/images/api-server-architecture.png" alt="API Server Architecture" width="40%">
 
 
-The API server stores desired state and remains independent of controller-specific logic. Controllers register the kinds they manage, consume their event streams, and reconcile external systems. They do not call one another directly.
+The API server stores desired state and remains independent of
+controller-specific logic. Controllers register the kinds they manage, consume
+their event streams, and reconcile external systems. They do not call one
+another directly.
 
 ---
 
@@ -52,7 +61,10 @@ controlplane/
     └── main.go
 ```
 
-`protocol` defines shared resource and event types, while `messaging` provides NATS JetStream operations. `api-server` serves the REST API and persists state. `gubctl` provides the command-line client, and each controller reconciles its resource kinds with an external system.
+`protocol` defines shared resource and event types, while `messaging` provides
+NATS JetStream operations. `api-server` serves the REST API and persists state.
+`gubctl` provides the command-line client, and each controller reconciles its
+resource kinds with an external system.
 
 ## `protocol`
 
@@ -1161,20 +1173,13 @@ Controllers recover through their durable JetStream consumer position, not throu
 
 A controller is a separate Go program. It registers its resource kind through the registration stream, then consumes events from the kind's durable JetStream stream. It reconciles each event with the external system that it manages.
 
-```mermaid
-flowchart TD
-    A["Register kind and consume events"] --> B["Receive event"]
-    B --> C["Reconcile desired state"]
-    C --> D["Change external system"]
-```
+
+<img src="./doc/images/dns-controller-event-flow.png" alt="Controller Event Flow" width="30%">
+
 
 Controllers must not depend on one another being online. For example:
 
-```mermaid
-flowchart TD
-    A["DNS controller"] --> B["API server"]
-    A --> C["DNS system"]
-```
+<img src="./doc/images/dns-controller-architecture-diagram.png" alt="Controller Event Flow" width="25%">
 
 The DNS controller does not call the certificate controller, and the certificate controller does not call the DNS controller. If controllers need to exchange information, they should use resources.
 
@@ -1850,24 +1855,12 @@ Creating a resource with a name that already exists returns HTTP `409 Conflict`.
 
 # API Request Flow
 
-A resource creation stores the resource and an `ADDED` outbox event in one transaction. The API server responds after the transaction commits; a background worker then publishes the event to JetStream.
+A resource creation stores the resource and an `ADDED` outbox event in one
+transaction. The API server responds after the transaction commits; a background
+worker then publishes the event to JetStream. 
 
-```mermaid
-flowchart TD
-    A["curl"] -->|"POST /api/v1/DNSRecord"| B["API server"]
-    B --> C["HTTP handler"]
-    C --> D["JSON decoder"]
-    D --> E["Store.Create()"]
+<img src="./doc/images/create-dnsrecord-api-flowchart.png" alt="Create DNS record" width="60%">
 
-    E --> F["Generate UID and resourceVersion"]
-    F --> G["Store resource and outbox event"]
-
-    G --> H["HTTP response"]
-    G --> I["HTTP watcher broadcast"]
-    G --> J["Outbox relay"]
-    J --> K["JetStream"]
-    K --> L["Durable controller consumer"]
-```
 
 The controller receives `ADDED` after the outbox relay publishes the event. JetStream confirms the publish before the relay removes the outbox row.
 
